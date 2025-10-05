@@ -1,0 +1,110 @@
+# {{ ansible_managed }}
+# Apache Virtual Host Configuration for Solr Admin UI
+# Customer: {{ customer_name | default(moodle_app_domain.split('.')[0]) }}
+# Domain: {{ moodle_app_domain }}
+# Generated: {{ ansible_date_time.iso8601 }}
+
+<VirtualHost *:80>
+    ServerName {{ moodle_app_domain }}
+    
+    # Redirect HTTP to HTTPS for Solr admin path
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} ^/{{ solr_admin_path | default('__solr') }}
+    RewriteRule ^(.*)$ https://%{HTTP_HOST}$1 [R=301,L]
+</VirtualHost>
+
+<IfModule mod_ssl.c>
+    <VirtualHost *:443>
+        ServerName {{ moodle_app_domain }}
+        
+        # SSL Configuration (uses existing certificates)
+        SSLEngine on
+        {% if ssl_certificate_available | default(false) %}
+        SSLCertificateFile /etc/letsencrypt/live/{{ moodle_app_domain }}/fullchain.pem
+        SSLCertificateKeyFile /etc/letsencrypt/live/{{ moodle_app_domain }}/privkey.pem
+        {% else %}
+        # Fallback to snakeoil certificates
+        SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem
+        SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+        {% endif %}
+        
+        # Modern SSL Configuration
+        SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+        SSLCipherSuite ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+        SSLHonorCipherOrder off
+        SSLSessionTickets off
+        
+        # Solr Admin UI Reverse Proxy
+        <Location /{{ solr_admin_path | default('__solr') }}>
+            ProxyPreserveHost Off
+            ProxyPass http://localhost:{{ solr_port | default(8983) }}/solr
+            ProxyPassReverse http://localhost:{{ solr_port | default(8983) }}/solr
+            
+            # Security Headers
+            RequestHeader set X-Forwarded-Proto "https"
+            RequestHeader set X-Forwarded-Port "443"
+            RequestHeader set X-Real-IP %{REMOTE_ADDR}s
+            
+            # Access Control
+            <RequireAll>
+                Require ip 127.0.0.1
+                Require ip ::1
+                Require ip {{ ansible_default_ipv4.address | default('127.0.0.1') }}
+                {% if solr_allowed_ips is defined and solr_allowed_ips | length > 0 %}
+                {% for ip in solr_allowed_ips %}
+                Require ip {{ ip }}
+                {% endfor %}
+                {% endif %}
+            </RequireAll>
+            # Timeout Settings for long operations
+            ProxyTimeout 300
+            
+            # Security: Prevent directory listing
+            Options -Indexes
+            
+            # Custom Logging
+            CustomLog ${APACHE_LOG_DIR}/{{ moodle_app_domain }}_solr_access.log combined
+            ErrorLog ${APACHE_LOG_DIR}/{{ moodle_app_domain }}_solr_error.log
+        </Location>
+        
+        #Direct Core API access (for Moodle internal use)
+        {% if solr_enable_api_proxy | default(false) %}
+        <Location /{{ solr_api_path | default('__solr_api') }}>
+            ProxyPreserveHost Off
+            ProxyPass http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}
+            ProxyPassReverse http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}
+            
+            RequestHeader set X-Forwarded-Proto "https"
+            RequestHeader set X-Forwarded-Port "443"
+            
+            # API Access - localhost only for Moodle
+            Require ip 127.0.0.1
+            Require ip ::1
+            
+            ProxyTimeout 300
+            Options -Indexes
+        </Location>
+        {% endif %}
+        
+        # Performance: Enable compression for Solr responses
+        <IfModule mod_deflate.c>
+            <LocationMatch "^/{{ solr_admin_path | default('__solr') }}">
+                AddOutputFilterByType DEFLATE application/json
+                AddOutputFilterByType DEFLATE application/xml
+                AddOutputFilterByType DEFLATE text/html
+                AddOutputFilterByType DEFLATE text/plain
+                AddOutputFilterByType DEFLATE text/css
+                AddOutputFilterByType DEFLATE application/javascript
+            </LocationMatch>
+        </IfModule>
+        
+        # Security Headers
+        <IfModule mod_headers.c>
+            Header always set X-Frame-Options "SAMEORIGIN"
+            Header always set X-Content-Type-Options "nosniff"
+            Header always set X-XSS-Protection "1; mode=block"
+            Header always set Referrer-Policy "no-referrer-when-downgrade"
+        </IfModule>
+        
+    </VirtualHost>
+</IfModule>

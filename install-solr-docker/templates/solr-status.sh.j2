@@ -1,0 +1,160 @@
+#!/bin/bash
+# =============================================================================
+# ELEDIA SOLR STATUS SCRIPT - OPTIMIZED
+# Version: 6.0 - Quick status check for {{ customer_name }}
+# Generated: {{ ansible_date_time.iso8601 }}
+# =============================================================================
+
+# Configuration
+CUSTOMER="{{ customer_name | default(moodle_app_domain.split('.')[0]) }}"
+CONTAINER_NAME="{{ solr_container_name | default('eledia_solr_' + customer_name) }}"
+CORE_NAME="{{ solr_core_name | default('eledia_solr_' + customer_name) }}"
+DOMAIN="{{ moodle_app_domain }}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Status indicators
+OK="${GREEN}✅${NC}"
+ERROR="${RED}❌${NC}"
+WARNING="${YELLOW}⚠️${NC}"
+INFO="${BLUE}ℹ️${NC}"
+
+echo -e "${BLUE}================================================================${NC}"
+echo -e "${BLUE}🔍 SOLR STATUS CHECK - $CUSTOMER${NC}"
+echo -e "${BLUE}================================================================${NC}"
+
+# Container check
+echo -ne "${INFO} Container Status: "
+if docker ps --format '{{ '{{' }}.Names{{ '}}' }}' | grep -q "^$CONTAINER_NAME$"; then
+    CONTAINER_STATUS=$(docker ps --format '{{ '{{' }}.Status{{ '}}' }}' --filter "name=$CONTAINER_NAME")
+    echo -e "$OK Running ($CONTAINER_STATUS)"
+    CONTAINER_OK=true
+else
+    if docker ps -a --format '{{ '{{' }}.Names{{ '}}' }}' | grep -q "^$CONTAINER_NAME$"; then
+        echo -e "$ERROR Stopped"
+    else
+        echo -e "$ERROR Not Found"
+    fi
+    CONTAINER_OK=false
+fi
+
+# API check
+echo -ne "${INFO} Solr API: "
+if [ "$CONTAINER_OK" = true ]; then
+    if curl -s --max-time 5 http://localhost:8983/solr/admin/cores >/dev/null 2>&1; then
+        echo -e "$OK Responding"
+        API_OK=true
+    else
+        echo -e "$ERROR Not Responding"
+        API_OK=false
+    fi
+else
+    echo -e "$ERROR Unavailable (Container Stopped)"
+    API_OK=false
+fi
+
+# Core check
+echo -ne "${INFO} Core Status: "
+if [ "$API_OK" = true ]; then
+    if curl -s http://localhost:8983/solr/admin/cores | grep -q "\"$CORE_NAME\""; then
+        echo -e "$OK Active"
+        CORE_OK=true
+    else
+        echo -e "$ERROR Missing"
+        CORE_OK=false
+    fi
+else
+    echo -e "$ERROR Cannot Check"
+    CORE_OK=false
+fi
+
+# Document count
+echo -ne "${INFO} Documents: "
+if [ "$CORE_OK" = true ]; then
+    DOC_COUNT=$(curl -s "http://localhost:8983/solr/$CORE_NAME/select?q=*:*&rows=0" 2>/dev/null | grep -o '"numFound":[0-9]*' | cut -d: -f2)
+    if [ -n "$DOC_COUNT" ]; then
+        if [ "$DOC_COUNT" -gt 0 ]; then
+            echo -e "$OK $DOC_COUNT indexed"
+        else
+            echo -e "$WARNING 0 (needs indexing)"
+        fi
+    else
+        echo -e "$ERROR Cannot retrieve count"
+    fi
+else
+    echo -e "$ERROR Cannot Check"
+fi
+
+# Port check
+echo -ne "${INFO} Port 8983: "
+if netstat -tlnp 2>/dev/null | grep -q ":8983 "; then
+    echo -e "$OK Listening"
+else
+    echo -e "$ERROR Not Listening"
+fi
+
+# Memory usage
+echo -ne "${INFO} Memory Usage: "
+if [ "$CONTAINER_OK" = true ]; then
+    MEM_USAGE=$(docker stats --no-stream --format "{{ '{{' }}.MemUsage{{ '}}' }}" $CONTAINER_NAME 2>/dev/null)
+    if [ -n "$MEM_USAGE" ]; then
+        echo -e "$OK $MEM_USAGE"
+    else
+        echo -e "$WARNING Cannot retrieve"
+    fi
+else
+    echo -e "$ERROR N/A"
+fi
+
+# Data directory
+echo -ne "${INFO} Data Directory: "
+DATA_DIR="{{ solr_data_dir | default('/opt/eledia-solr-data/' + customer_name) }}"
+if [ -d "$DATA_DIR" ]; then
+    SIZE=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)
+    echo -e "$OK $SIZE"
+else
+    echo -e "$ERROR Missing"
+fi
+
+# Last index update
+echo -ne "${INFO} Last Update: "
+if [ "$CONTAINER_OK" = true ] && [ "$CORE_OK" = true ]; then
+    LAST_UPDATE=$(docker exec $CONTAINER_NAME find /var/solr/data/$CORE_NAME/data/index -name "segments_*" -exec stat -c %Y {} \; 2>/dev/null | sort -n | tail -1)
+    if [ -n "$LAST_UPDATE" ]; then
+        LAST_DATE=$(date -d "@$LAST_UPDATE" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        echo -e "$OK $LAST_DATE"
+    else
+        echo -e "$WARNING No index files found"
+    fi
+else
+    echo -e "$ERROR Cannot Check"
+fi
+
+echo -e "${BLUE}================================================================${NC}"
+
+# Overall status
+if [ "$CONTAINER_OK" = true ] && [ "$API_OK" = true ] && [ "$CORE_OK" = true ]; then
+    echo -e "${GREEN}🎉 OVERALL STATUS: HEALTHY${NC}"
+    EXIT_CODE=0
+else
+    echo -e "${RED}💥 OVERALL STATUS: UNHEALTHY${NC}"
+    echo -e "${YELLOW}💡 Try: /opt/eledia-solr-scripts/$CUSTOMER/manage_solr.sh restart${NC}"
+    EXIT_CODE=1
+fi
+
+echo -e "${BLUE}================================================================${NC}"
+
+# Quick commands reminder
+if [ "$1" != "--quiet" ]; then
+    echo -e "${BLUE}💡 Quick Commands:${NC}"
+    echo -e "   Restart: /opt/eledia-solr-scripts/$CUSTOMER/manage_solr.sh restart"
+    echo -e "   Logs:    /opt/eledia-solr-scripts/$CUSTOMER/manage_solr.sh logs"
+    echo -e "   Health:  /opt/eledia-solr-scripts/$CUSTOMER/manage_solr.sh health"
+fi
+
+exit $EXIT_CODE

@@ -1,0 +1,60 @@
+<?php
+// =============================================================================
+// MOODLE SOLR CONFIGURATION - OPTIMIZED
+// Version: 6.0 - Direct Solr configuration for {{ customer_name }}
+// Generated: {{ ansible_date_time.iso8601 }}
+// Domain: {{ moodle_app_domain }}
+// =============================================================================
+
+// Global search configuration
+$CFG->enableglobalsearch = true;
+$CFG->searchengine = 'solr';
+
+// Solr server configuration - Direct access (no proxy)
+$CFG->solrhosts = array(
+    array(
+        'hostname' => 'localhost',
+        'port' => 8983,
+        'username' => '',
+        'password' => '',
+        'protocol' => 'http',
+        'timeout' => 30,
+    )
+);
+
+// Core configuration
+$CFG->solrcore = '{{ solr_core_name | default("eledia_solr_" + customer_name) }}';
+$CFG->solrpath = '/solr/{{ solr_core_name | default("eledia_solr_" + customer_name) }}';
+
+{% if solr_auth_enabled | default(false) %}
+// Authentication (if enabled)
+$CFG->solrhosts[0]['username'] = '{{ solr_moodle_user | default(customer_name + "_moodle") }}';
+$CFG->solrhosts[0]['password'] = '{{ solr_moodle_password | default("auto_generated_password") }}';
+{% endif %}
+
+// Performance optimizations
+$CFG->solrindexclientclass = '\\core_search\\engine\\solr_search_client';
+$CFG->solrindexsize = 1000;          // Documents per batch
+$CFG->solrcommitwithin = 15000;      // Commit within 15 seconds
+$CFG->solrconnecttimeout = 10;       // Connection timeout
+$CFG->solrreadtimeout = 30;          // Read timeout
+
+// Security settings
+$CFG->solrsslcert = false;           // No SSL for direct connection
+$CFG->solrsslkey = false;
+$CFG->solrsslca = false;
+$CFG->solrsecuremode = false;        // Direct access mode
+
+// Index management
+$CFG->searchindexwhendisabled = false;
+$CFG->searchindexinterval = 300;     // 5 minutes between indexing
+$CFG->searchmaxindexfilter = 300;    // Max files per indexing run
+
+// Customer-specific settings
+$CFG->solr_customer_name = '{{ customer_name | default(moodle_app_domain.split('.')[0]) }}';
+$CFG->solr_installation_date = {{ ansible_date_time.epoch }};
+$CFG->solr_version = '6.0';
+
+// =============================================================================
+// END OF SOLR CONFIGURATION
+// =============================================================================

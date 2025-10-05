@@ -1,0 +1,279 @@
+---
+# =============================================================================
+# STATUS CHECK v3.3.1 - Multi-Tenant Support
+# Version: 7.0 - Enhanced for Docker v3.3.1 and Multi-Tenant architecture
+# Performance: Optimized status checking with system_type awareness
+# =============================================================================
+
+- name: "[STATUS] Display Status Check Banner v3.3.1"
+  debug:
+    msg:
+      - "================================================================"
+      - "🔍 ELEDIA SOLR STATUS CHECK v3.3.1"
+      - "================================================================"
+      - "Mode: {{ 'Single-Tenant (Moodle)' if solr_is_single_tenant else 'Multi-Tenant (Solr Server)' }}"
+      - "Customer: {{ customer_name }}"
+      - "Container: {{ solr_docker_container_name }}"
+      - "Domain: {{ moodle_app_domain | default('Multi-Tenant Server') }}"
+      - "================================================================"
+
+# =============================================================================
+# v3.3.1 COMPREHENSIVE STATUS COLLECTION
+# =============================================================================
+- name: "[STATUS] Collect system status v3.3.1 (parallel)"
+  block:
+    - name: Check Docker service
+      systemd:
+        name: docker
+      register: docker_service_status
+      
+    - name: Check container status (v3.3.1)
+      community.docker.docker_container_info:
+        name: "{{ solr_docker_container_name }}"
+      register: container_info
+      failed_when: false
+
+    - name: Check Docker volumes (v3.3.1)
+      shell: |
+        for vol in {{ solr_docker_container_name }}_data {{ solr_docker_container_name }}_logs {{ solr_docker_container_name }}_config; do
+          if docker volume inspect $vol >/dev/null 2>&1; then
+            echo "$vol:exists:$(docker volume inspect $vol --format '{{ '{{' }}.Mountpoint{{ '}}' }}')"
+          else
+            echo "$vol:missing:none"
+          fi
+        done
+      register: volume_status
+      changed_when: false
+
+    - name: Check volume usage (v3.3.1)
+      shell: |
+        for vol in {{ solr_docker_container_name }}_data {{ solr_docker_container_name }}_logs {{ solr_docker_container_name }}_config; do
+          if docker volume inspect $vol >/dev/null 2>&1; then
+            mountpoint=$(docker volume inspect $vol --format '{{ '{{' }}.Mountpoint{{ '}}' }}')
+            size=$(sudo du -sh "$mountpoint" 2>/dev/null | cut -f1 || echo "0B")
+            echo "$vol:$size"
+          else
+            echo "$vol:N/A"
+          fi
+        done
+      register: volume_usage
+      changed_when: false
+      become: true
+      failed_when: false
+      
+    - name: Test Solr API (production-ready auth)
+      uri:
+        url: "http://localhost:{{ solr_docker_port }}/solr/admin/ping"
+        url_username: "{{ solr_admin_user }}"
+        url_password: "{{ solr_admin_password }}"
+        timeout: 5
+        force_basic_auth: true
+      register: solr_api_status
+      failed_when: false
+      
+    - name: Test Core status (Single-Tenant)
+      uri:
+        url: "http://localhost:{{ solr_docker_port }}/solr/{{ solr_core_name }}/admin/ping"
+        url_username: "{{ solr_admin_user }}"
+        url_password: "{{ solr_admin_password }}"
+        timeout: 5
+        force_basic_auth: true
+      register: core_status
+      failed_when: false
+      when: solr_is_single_tenant
+
+    - name: Test Multi-Tenant cores status
+      uri:
+        url: "http://localhost:{{ solr_docker_port }}/solr/admin/cores?action=STATUS"
+        url_username: "{{ solr_admin_user }}"
+        url_password: "{{ solr_admin_password }}"
+        timeout: 5
+        force_basic_auth: true
+      register: cores_status
+      failed_when: false
+      when: solr_is_multi_tenant
+      
+    - name: Check installation metadata (v3.3.1)
+      stat:
+        path: "{{ solr_data_base_dir }}/{{ customer_name }}/installation.env"
+      register: installation_metadata
+
+# =============================================================================
+# v3.3.1 STATUS ANALYSIS
+# =============================================================================
+- name: "[STATUS] Parse v3.3.1 status results"
+  set_fact:
+    docker_running: "{{ docker_service_status.status.ActiveState == 'active' }}"
+    container_exists: "{{ container_info.exists | default(false) }}"
+    container_state: "{{ container_info.container.State.Status | default('not_found') }}"
+    container_health: "{{ container_info.container.State.Health.Status | default('unknown') }}"
+    container_running: "{{ container_info.container.State.Running | default(false) }}"
+    solr_api_healthy: "{{ solr_api_status.status | default(0) == 200 }}"
+    core_healthy: "{{ core_status.status | default(0) == 200 if solr_is_single_tenant else true }}"
+    cores_healthy: "{{ cores_status.status | default(0) == 200 if solr_is_multi_tenant else true }}"
+    installation_exists: "{{ installation_metadata.stat.exists }}"
+
+- name: "[STATUS] Load installation metadata (v3.3.1)"
+  slurp:
+    src: "{{ solr_data_base_dir }}/{{ customer_name }}/installation.env"
+  register: metadata_content
+  when: installation_exists
+
+- name: "[STATUS] Parse installation data (v3.3.1)"
+  set_fact:
+    installation_data: "{{ (metadata_content.content | b64decode).split('\n') | select('match', '^[A-Z_]+=.*') | map('regex_replace', '^([A-Z_]+)=\"?([^\"]*)\"?$', '\\1: \\2') | list }}"
+  when: installation_exists
+
+# =============================================================================
+# v3.3.1 DETAILED DIAGNOSTICS (IF ISSUES FOUND)
+# =============================================================================
+- name: "[DIAG] v3.3.1 detailed diagnostics"
+  block:
+    - name: Get container logs (last 20 lines)
+      shell: docker logs --tail 20 {{ solr_docker_container_name }} 2>&1 || echo "No logs available"
+      register: container_logs
+      
+    - name: Check disk space (v3.3.1)
+      shell: df -h {{ solr_data_base_dir }}/{{ customer_name }} 2>/dev/null || echo "Path not found"
+      register: disk_usage
+      
+    - name: Check port availability (v3.3.1)
+      shell: netstat -tulpn | grep :{{ solr_docker_port }} || echo "Port not listening"
+      register: port_check
+
+    - name: Get Multi-Tenant cores list (if applicable)
+      uri:
+        url: "http://localhost:{{ solr_docker_port }}/solr/admin/cores?action=STATUS&wt=json"
+        url_username: "{{ solr_admin_user }}"
+        url_password: "{{ solr_admin_password }}"
+        force_basic_auth: true
+      register: cores_list
+      failed_when: false
+      when: solr_is_multi_tenant
+
+  when: not (solr_api_healthy and (core_healthy if solr_is_single_tenant else cores_healthy) and container_state == 'running')
+
+# =============================================================================
+# MULTI-TENANT CORE MANAGEMENT INFO
+# =============================================================================
+- name: "[STATUS] Get Multi-Tenant cores information (always for Multi-Tenant)"
+  uri:
+    url: "http://localhost:{{ solr_docker_port }}/solr/admin/cores?action=STATUS&wt=json"
+    url_username: "{{ solr_admin_user }}"
+    url_password: "{{ solr_admin_password }}"
+    force_basic_auth: true
+    timeout: 10
+  register: all_cores_info
+  failed_when: false
+  when: solr_is_multi_tenant
+
+- name: "[STATUS] Parse Multi-Tenant cores details"
+  set_fact:
+    cores_details: >-
+      {{
+        all_cores_info.json.status | dict2items | 
+        map('combine', {'name': item.key}) |
+        map('combine', {'size_mb': ((item.value.index.sizeInBytes | default(0) | int) / 1024 / 1024) | round(1)}) |
+        map('combine', {'docs': item.value.index.numDocs | default(0)}) |
+        list
+      }}
+  when: 
+    - solr_is_multi_tenant
+    - all_cores_info.status == 200
+    - all_cores_info.json is defined
+
+- name: "[STATUS] Check core management log"
+  shell: |
+    if docker exec {{ solr_docker_container_name }} test -f /var/solr/logs/core_management.log; then
+      docker exec {{ solr_docker_container_name }} tail -5 /var/solr/logs/core_management.log
+    else
+      echo "No core management log found"
+    fi
+  register: core_management_log
+  failed_when: false
+  when: solr_is_multi_tenant
+
+# =============================================================================
+# v3.3.1 STATUS SUMMARY WITH MULTI-TENANT SUPPORT
+# =============================================================================
+- name: "[STATUS] v3.3.1 Comprehensive Status Report"
+  debug:
+    msg:
+      - "================================================================"
+      - "📊 ELEDIA SOLR STATUS REPORT v3.3.1"
+      - "================================================================"
+      - ""
+      - "🏗️ DEPLOYMENT MODE:"
+      - "  Type: {{ 'Single-Tenant (Moodle Integration)' if solr_is_single_tenant else 'Multi-Tenant (Solr Server)' }}"
+      - "  Customer: {{ customer_name }}"
+      - "  Container: {{ solr_docker_container_name }}"
+      - "  Image: {{ solr_docker_image_tag }}"
+      - "  Port: {{ solr_docker_port }}"
+      - "  Memory: {{ solr_docker_memory }}"
+      - ""
+      - "🔧 SYSTEM COMPONENTS:"
+      - "  Docker Service: {{ '✅ Active' if docker_running else '❌ Inactive' }}"
+      - "  Container Exists: {{ '✅ Found' if container_exists else '❌ Not Found' }}"
+      - "  Container State: {{ '✅ ' + container_state if container_state == 'running' else '❌ ' + container_state }}"
+      - "  Container Health: {{ '✅ ' + container_health if container_health == 'healthy' else '⚠️ ' + container_health }}"
+      - "  Solr API: {{ '✅ Responding (Auth)' if solr_api_healthy else '❌ Not responding' }}"
+      - "{% if solr_is_single_tenant %}"
+      - "  Solr Core: {{ '✅ Healthy' if core_healthy else '❌ Unhealthy' }}"
+      - "{% else %}"
+      - "  Solr Cores: {{ '✅ Multi-Tenant Ready' if cores_healthy else '❌ Not Ready' }}"
+      - "{% endif %}"
+      - ""
+      - "🗄️ DOCKER VOLUMES:"
+      - "{% for line in volume_status.stdout_lines %}"
+      - "  {{ line.split(':')[0] }}: {{ '✅ ' + line.split(':')[1] if 'exists' in line else '❌ Missing' }}"
+      - "{% endfor %}"
+      - ""
+      - "💾 VOLUME USAGE:"
+      - "{% for line in volume_usage.stdout_lines %}"
+      - "  {{ line.split(':')[0] }}: {{ line.split(':')[1] }}"
+      - "{% endfor %}"
+      - ""
+      - "📁 INSTALLATION:"
+      - "  Metadata: {{ '✅ Found' if installation_exists else '❌ Missing' }}"
+      - "{{ '  Details: ' + (installation_data | join('\n           ')) if installation_exists else '  Status: Not properly installed' }}"
+      - ""
+      - "🔗 ACCESS URLS:"
+      - "  Admin UI: http://localhost:{{ solr_docker_port }}/solr/ (Auth Required)"
+      - "{% if solr_is_single_tenant %}"
+      - "  Core URL: http://localhost:{{ solr_docker_port }}/solr/{{ solr_core_name }}/"
+      - "{% else %}"
+      - "  Cores API: http://localhost:{{ solr_docker_port }}/solr/admin/cores"
+      - "{% endif %}"
+      - "  Health Check: http://localhost:{{ solr_docker_port }}/solr/admin/ping"
+      - ""
+      - "{% if solr_is_multi_tenant and cores_details is defined %}"
+      - "🌐 MULTI-TENANT CORES MANAGEMENT:"
+      - "{% for core in cores_details %}"
+      - "  📦 {{ core.name }}:"
+      - "    - Size: {{ core.size_mb }} MB"
+      - "    - Documents: {{ core.docs }}"
+      - "    - Status: ✅ Active"
+      - "{% endfor %}"
+      - ""
+      - "📋 CORE MANAGEMENT COMMANDS:"
+      - "  Add Core: ansible-playbook install-solr.yml -e add_solr_core=\"customer_name\""
+      - "  Remove Core: ansible-playbook install-solr.yml -e remove_solr_core=\"customer_name\""
+      - "  Force Remove: ansible-playbook install-solr.yml -e remove_solr_core=\"customer_name\" -e force_core_removal=true"
+      - ""
+      - "📝 RECENT CORE MANAGEMENT ACTIVITY:"
+      - "{% for line in core_management_log.stdout_lines %}"
+      - "  {{ line }}"
+      - "{% endfor %}"
+      - "{% elif solr_is_multi_tenant %}"
+      - "🌐 MULTI-TENANT SERVER (Empty):"
+      - "  No cores currently configured."
+      - "  Add first core: ansible-playbook install-solr.yml -e add_solr_core=\"customer_name\""
+      - "{% endif %}"
+      - ""
+      - "📊 OVERALL STATUS: {{ '🟢 HEALTHY' if (solr_api_healthy and (core_healthy if solr_is_single_tenant else cores_healthy) and container_state == 'running') else '🔴 NEEDS ATTENTION' }}"
+      - ""
+      - "{{ '🛠️ DIAGNOSTICS:' if not (solr_api_healthy and (core_healthy if solr_is_single_tenant else cores_healthy) and container_state == 'running') else '' }}"
+      - "{{ '  Container Logs: ' + (container_logs.stdout | default('N/A'))[-200:] if not (solr_api_healthy and (core_healthy if solr_is_single_tenant else cores_healthy) and container_state == 'running') else '' }}"
+      - "{{ '  Disk Usage: ' + disk_usage.stdout if not (solr_api_healthy and (core_healthy if solr_is_single_tenant else cores_healthy) and container_state == 'running') else '' }}"
+      - "{{ '  Port Status: ' + port_check.stdout if not (solr_api_healthy and (core_healthy if solr_is_single_tenant else cores_healthy) and container_state == 'running') else '' }}"
+      - "================================================================"

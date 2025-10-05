@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<config>
+
+  <luceneMatchVersion>9.9.0</luceneMatchVersion>
+
+  <!-- Managed Schema -->
+  <schemaFactory class="ManagedIndexSchemaFactory">
+    <bool name="mutable">true</bool>
+    <str name="managedSchemaResourceName">managed-schema</str>
+  </schemaFactory>
+
+  <!-- DirectoryFactory -->
+  <directoryFactory name="DirectoryFactory" class="solr.StandardDirectoryFactory"/>
+
+  <!-- Update Handler -->
+  <updateHandler class="solr.DirectUpdateHandler2">
+    <autoCommit>
+      <maxTime>15000</maxTime>
+      <openSearcher>true</openSearcher>
+    </autoCommit>
+    <autoSoftCommit>
+      <maxTime>5000</maxTime>
+    </autoSoftCommit>
+  </updateHandler>
+
+  <!-- Standard Search Handler -->
+  <requestHandler name="/select" class="solr.SearchHandler" />
+
+  <!-- Ping Handler -->
+  <requestHandler name="/ping" class="solr.PingRequestHandler">
+    <lst name="invariants">
+      <str name="qt">/select</str>
+      <str name="q">*:*</str>
+    </lst>
+  </requestHandler>
+
+  <!-- Update Handler -->
+  <requestHandler name="/update" class="solr.UpdateRequestHandler" />
+
+  <!-- Replication (Optional) -->
+  <requestHandler name="/replication" class="solr.ReplicationHandler" />
+
+  <!-- Query + Caffeine Caches -->
+  <query>
+    <maxBooleanClauses>1024</maxBooleanClauses>
+    <filterCache class="solr.CaffeineCache" size="512" initialSize="512"/>
+    <queryResultCache class="solr.CaffeineCache" size="512" initialSize="512"/>
+    <documentCache class="solr.CaffeineCache" size="512" initialSize="512"/>
+  </query>
+
+  <!-- Dispatcher ohne deprecated Flags -->
+  <requestDispatcher>
+    <requestParsers multipartUploadLimitInKB="2048"
+                    formdataUploadLimitInKB="2048"/>
+  </requestDispatcher>
+
+  <!-- Core-level Logging für Admin -->
+  <logging>
+    <watcher size="50" threshold="WARN"/>
+  </logging>
+
+</config>

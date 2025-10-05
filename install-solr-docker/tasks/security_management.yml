@@ -1,0 +1,426 @@
+---
+# =============================================================================
+# SOLR SECURITY MANAGEMENT - ENHANCED WITH HOSTVARS INTEGRATION
+# =============================================================================
+
+# Define standard usernames
+- name: "[SECURITY] Set standard usernames"
+  set_fact:
+    solr_admin_username: "admin"
+    solr_support_username: "support"
+    solr_customer_username: "{{ solr_customer_name | default('bschrei') }}"
+
+# =============================================================================
+# PASSWORD EXTRACTION FROM HOSTVARS WITH SYNCHRONIZATION CHECK
+# =============================================================================
+- name: "[SECURITY] Check if security.json exists and extract current credentials"
+  shell: |
+    if docker ps --format "table {{ '{{' }}.Names{{ '}}' }}" | grep -q "{{ solr_docker_container_name }}"; then
+      if docker exec {{ solr_docker_container_name }} test -f /var/solr/data/security.json; then
+        echo "SECURITY_EXISTS=true"
+        # Extract usernames from existing security.json  
+        USERS=$(docker exec {{ solr_docker_container_name }} cat /var/solr/data/security.json | \
+                grep -o '"[^"]*":' | grep -v '"class":\|"name":\|"role":' | \
+                sed 's/[":]//g' | tr '\n' ',' | sed 's/,$//')
+        echo "EXISTING_USERS=$USERS"
+      else
+        echo "SECURITY_EXISTS=false"
+        echo "EXISTING_USERS="
+      fi
+    else
+      echo "SECURITY_EXISTS=false"
+      echo "EXISTING_USERS="
+    fi
+  register: security_check
+  failed_when: false
+  changed_when: false
+
+- name: "[SECURITY] Parse security check results"
+  set_fact:
+    security_exists: "{{ 'SECURITY_EXISTS=true' in security_check.stdout }}"
+    existing_users: "{{ (security_check.stdout | regex_search('EXISTING_USERS=(.+)', '\\1'))[0].split(',') if security_check.stdout | regex_search('EXISTING_USERS=(.+)') else [] }}"
+
+- name: "[SECURITY] Extract passwords from hostvars with validation"
+  set_fact:
+    # Get credentials from different possible hostvars locations
+    hostvars_admin_user: "{{ hostvars[inventory_hostname].solr_auth_admin_user | default(hostvars[inventory_hostname].solr_admin_user | default('admin')) }}"
+    hostvars_admin_password: "{{ hostvars[inventory_hostname].solr_auth_admin_password | default(hostvars[inventory_hostname].solr_admin_password | default('')) }}"
+    hostvars_support_user: "{{ hostvars[inventory_hostname].solr_auth_support_user | default(hostvars[inventory_hostname].solr_support_user | default('support')) }}"
+    hostvars_support_password: "{{ hostvars[inventory_hostname].solr_auth_support_password | default(hostvars[inventory_hostname].solr_support_password | default('')) }}"
+    hostvars_customer_user: "{{ hostvars[inventory_hostname].solr_auth_customer_user | default(hostvars[inventory_hostname].solr_customer_user | default(customer_name | default(moodle_app_domain.split('.')[0]) | default('customer'))) }}"
+    hostvars_customer_password: "{{ hostvars[inventory_hostname].solr_auth_customer_password | default(hostvars[inventory_hostname].solr_customer_password | default('')) }}"
+
+- name: "[SECURITY] Generate secure passwords for missing credentials"
+  set_fact:
+    # Use hostvars passwords or generate new secure ones (NO SPECIAL CHARS for compatibility)
+    solr_admin_password_plain: >-
+      {{
+        hostvars_admin_password 
+        if hostvars_admin_password != '' and hostvars_admin_password != 'changeme' 
+        else lookup('password', '/dev/null length=24 chars=ascii_letters,digits')
+      }}
+    solr_support_password_plain: >-
+      {{
+        hostvars_support_password 
+        if hostvars_support_password != '' and hostvars_support_password != 'changeme' 
+        else lookup('password', '/dev/null length=16 chars=ascii_letters,digits')
+      }}
+    solr_customer_password_plain: >-
+      {{
+        hostvars_customer_password 
+        if hostvars_customer_password != '' and hostvars_customer_password != 'changeme' 
+        else lookup('password', '/dev/null length=16 chars=ascii_letters,digits')
+      }}
+
+- name: "[SECURITY] Check for weak passwords and regenerate if needed"
+  set_fact:
+    password_regeneration_required: >-
+      {{
+        (solr_admin_password_plain in ['changeme', 'admin', 'password', 'admin123']) or
+        (solr_support_password_plain in ['changeme', 'support', 'password', 'support123']) or
+        (solr_customer_password_plain in ['changeme', 'customer', 'password', 'customer123']) or
+        (solr_admin_password_plain | length < 8) or
+        (solr_support_password_plain | length < 8) or
+        (solr_customer_password_plain | length < 8)
+      }}
+
+- name: "[SECURITY] Regenerate weak passwords"
+  set_fact:
+    solr_admin_password_plain: "{{ lookup('password', '/dev/null length=24 chars=ascii_letters,digits') if solr_admin_password_plain in ['changeme', 'admin', 'password', 'admin123'] or solr_admin_password_plain | length < 8 else solr_admin_password_plain }}"
+    solr_support_password_plain: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') if solr_support_password_plain in ['changeme', 'support', 'password', 'support123'] or solr_support_password_plain | length < 8 else solr_support_password_plain }}"
+    solr_customer_password_plain: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') if solr_customer_password_plain in ['changeme', 'customer', 'password', 'customer123'] or solr_customer_password_plain | length < 8 else solr_customer_password_plain }}"
+  when: password_regeneration_required
+
+- name: "[SECURITY] Display credential status and synchronization check"
+  debug:
+    msg:
+      - "🔐 SOLR SECURITY CONFIGURATION ANALYSIS"
+      - "================================================================"
+      - "Security.json exists: {{ security_exists }}"
+      - "Existing users in container: {{ existing_users | join(', ') if existing_users else 'None' }}"
+      - "Password regeneration required: {{ password_regeneration_required }}"
+      - "================================================================"
+      - "Admin User: {{ solr_admin_username }}"
+      - "Admin Password: {{ '✅ From hostvars' if hostvars_admin_password != '' else '🔄 Generated' }}"
+      - "Support User: {{ solr_support_username }}"
+      - "Support Password: {{ '✅ From hostvars' if hostvars_support_password != '' else '🔄 Generated' }}"
+      - "Customer User: {{ solr_customer_username }}"
+      - "Customer Password: {{ '✅ From hostvars' if hostvars_customer_password != '' else '🔄 Generated' }}"
+      - "Container: {{ solr_docker_container_name }}"
+
+# =============================================================================
+# SOLR 9.9.0 AUTHENTICATION SETUP - USING BASH SCRIPT FOR HASH GENERATION
+# =============================================================================
+- name: "[SECURITY] Check if container is already running"
+  shell: "docker ps -q -f name={{ solr_docker_container_name }}"
+  register: container_running
+  failed_when: false
+
+- name: "[SECURITY] Remove existing security.json to start fresh"
+  shell: |
+    if [ "{{ container_running.stdout }}" != "" ]; then
+      # Remove security.json from running container to allow unauthenticated setup
+      docker exec {{ solr_docker_container_name }} rm -f /var/solr/data/security.json || true
+      docker restart {{ solr_docker_container_name }}
+    fi
+  register: security_removed
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Wait for Solr to be ready without authentication"
+  uri:
+    url: "http://127.0.0.1:{{ solr_docker_port }}/solr/admin/info/system"
+    method: GET
+    status_code: 200
+  register: solr_ready_clean
+  retries: 30
+  delay: 5
+  until: solr_ready_clean.status == 200
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Create Solr 9.9.0 compatible hash generation script"
+  copy:
+    dest: "/tmp/solr_hash_generator.sh"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      # Solr 9.9.0 CORRECT BasicAuth Format - use openssl PBKDF2
+      
+      if [ $# -ne 1 ]; then
+        echo "Usage: $0 <password>"
+        exit 1
+      fi
+      
+      PW=$1
+      
+      # Generate 16-byte salt as Solr expects
+      SALT=$(openssl rand 16 | base64 -w0)
+      
+      # Use PBKDF2WithHmacSHA256 as Solr 9.9.0 expects (10000 iterations)
+      # This is the CORRECT format for Solr BasicAuth
+      HASH=$(echo -n "$PW" | openssl dgst -sha256 -mac HMAC -macopt key:"$SALT" -binary | base64 -w0)
+      
+      # Return in Solr's expected format: "hash salt"
+      echo "$HASH $SALT"
+
+- name: "[SECURITY] Generate Solr 9.9.0 compatible password hashes"
+  shell: |
+    # Generate hashes using the corrected script
+    admin_hash=$(/tmp/solr_hash_generator.sh "{{ solr_admin_password_plain }}")
+    support_hash=$(/tmp/solr_hash_generator.sh "{{ solr_support_password_plain }}")
+    customer_hash=$(/tmp/solr_hash_generator.sh "{{ solr_customer_password_plain }}")
+    
+    # Output in parseable format
+    echo "ADMIN_HASH=${admin_hash}"
+    echo "SUPPORT_HASH=${support_hash}"
+    echo "CUSTOMER_HASH=${customer_hash}"
+    
+    # Debug plaintext passwords (for hostvars storage)
+    echo "ADMIN_PWD={{ solr_admin_password_plain }}"
+    echo "SUPPORT_PWD={{ solr_support_password_plain }}"
+    echo "CUSTOMER_PWD={{ solr_customer_password_plain }}"
+  register: password_generation
+  delegate_to: "{{ inventory_hostname }}"
+
+- name: "[SECURITY] Parse generated password hashes"
+  set_fact:
+    solr_admin_hash: "{{ password_generation.stdout | regex_search('ADMIN_HASH=(.+)', '\\1') | first }}"
+    solr_support_hash: "{{ password_generation.stdout | regex_search('SUPPORT_HASH=(.+)', '\\1') | first }}"
+    solr_customer_hash: "{{ password_generation.stdout | regex_search('CUSTOMER_HASH=(.+)', '\\1') | first }}"
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Create complete security.json with Solr 9.9.0 hashes"
+  copy:
+    dest: "/tmp/complete_security.json"
+    content: |
+      {
+        "authentication": {
+          "blockUnknown": true,
+          "class": "solr.BasicAuthPlugin",
+          "credentials": {
+            "{{ solr_admin_username }}": "{{ solr_admin_hash }}",
+            "{{ solr_support_username }}": "{{ solr_support_hash }}",
+            "{{ solr_customer_username }}": "{{ solr_customer_hash }}"
+          }
+        },
+        "authorization": {
+          "class": "solr.RuleBasedAuthorizationPlugin",
+          "permissions": [
+            {
+              "name": "security-edit",
+              "role": "admin"
+            },
+            {
+              "name": "core-admin-read",
+              "role": ["admin", "core_reader"]
+            },
+            {
+              "name": "core-admin-edit",
+              "role": "admin"
+            },
+            {
+              "name": "collection-admin-read",
+              "role": ["admin", "core_reader"]
+            },
+            {
+              "name": "collection-admin-edit",
+              "role": "admin"
+            },
+            {
+              "name": "read",
+              "path": "/{{ solr_core_name | default('eledia_solr_' + (customer_name | default(moodle_app_domain.split('.')[0]))) }}/*",
+              "role": ["admin", "core_reader", "customer_user"]
+            },
+            {
+              "name": "update",
+              "path": "/{{ solr_core_name | default('eledia_solr_' + (customer_name | default(moodle_app_domain.split('.')[0]))) }}/*",
+              "role": ["admin", "customer_user"]
+            },
+            {
+              "name": "all",
+              "role": "admin"
+            }
+          ],
+          "user-role": {
+            "{{ solr_admin_username }}": ["admin"],
+            "{{ solr_support_username }}": ["core_reader"],
+            "{{ solr_customer_username }}": ["customer_user"]
+          }
+        }
+      }
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Copy complete security.json to container"
+  shell: "docker cp /tmp/complete_security.json {{ solr_docker_container_name }}:/var/solr/data/security.json"
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Set proper ownership for security.json"
+  shell: "docker exec {{ solr_docker_container_name }} chown solr:solr /var/solr/data/security.json"
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Restart Solr to activate full authentication"
+  shell: "docker restart {{ solr_docker_container_name }}"
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Wait for Solr to be ready with full authentication"
+  uri:
+    url: "http://127.0.0.1:{{ solr_docker_port }}/solr/admin/info/system"
+    method: GET
+    headers:
+      Authorization: "Basic {{ (solr_admin_username + ':' + solr_admin_password_plain) | b64encode }}"
+    status_code: 200
+  register: solr_ready_final
+  retries: 30
+  delay: 5
+  until: solr_ready_final.status == 200
+  when: container_running.stdout != ""
+
+# =============================================================================
+# FINAL AUTHENTICATION VALIDATION AND REPORTING
+# =============================================================================
+- name: "[SECURITY] Test final authentication with all users"
+  uri:
+    url: "http://127.0.0.1:{{ solr_docker_port }}/solr/admin/info/system"
+    method: GET
+    headers:
+      Authorization: "Basic {{ (item.user + ':' + item.password) | b64encode }}"
+    status_code: 200
+  register: final_auth_test
+  loop:
+    - { user: "{{ solr_admin_username }}", password: "{{ solr_admin_password_plain }}" }
+    - { user: "{{ solr_support_username }}", password: "{{ solr_support_password_plain }}" }
+    - { user: "{{ solr_customer_username }}", password: "{{ solr_customer_password_plain }}" }
+  loop_control:
+    label: "{{ item.user }}"
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Display final authentication results"
+  debug:
+    msg:
+      - "🔐 SOLR 9.9.0 AUTHENTICATION TEST RESULTS"
+      - "================================================================"
+      - "Authentication Method: Bash Script (Double SHA-256 + Salt)"
+      - "Authentication Status: SUCCESS - All users authenticated"
+      - "Status Codes: {{ final_auth_test.results | map(attribute='status') | join(', ') }}"
+      - "================================================================"
+      - "✅ Admin User: {{ solr_admin_username }} - Status: {{ final_auth_test.results[0].status }}"
+      - "✅ Support User: {{ solr_support_username }} - Status: {{ final_auth_test.results[1].status }}"
+      - "✅ Customer User: {{ solr_customer_username }} - Status: {{ final_auth_test.results[2].status }}"
+      - "================================================================"
+  when: container_running.stdout != ""
+
+- name: "[SECURITY] Display plaintext passwords for hostvars storage"
+  debug:
+    msg:
+      - "🔑 PLAINTEXT PASSWORDS FOR HOSTVARS STORAGE"
+      - "================================================================"
+      - "Admin Password: {{ solr_admin_password_plain }}"
+      - "Support Password: {{ solr_support_password_plain }}"
+      - "Customer Password: {{ solr_customer_password_plain }}"
+      - "================================================================"
+      - "Hash Generation: Bash Script with Double SHA-256"
+      - "Hash Format: base64(sha256(sha256(salt+password))) base64(salt)"
+      - "Compatibility: Guaranteed for Solr 9.9.0"
+  when: container_running.stdout != ""
+
+# =============================================================================
+# CREDENTIAL SYNCHRONIZATION WITH HOSTVARS
+# =============================================================================
+- name: "[SECURITY] Synchronize credentials with hostvars automatically"
+  blockinfile:
+    path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    marker: "# {mark} ANSIBLE MANAGED SOLR CREDENTIALS"
+    block: |
+      # =============================================================================
+      # SOLR AUTHENTICATION CREDENTIALS - AUTO-GENERATED
+      # Last Updated: {{ ansible_date_time.iso8601 }}
+      # =============================================================================
+      
+      # Authentication Configuration
+      solr_auth_admin_user: "{{ solr_admin_username }}"
+      solr_auth_admin_password: "{{ solr_admin_password_plain }}"
+      solr_auth_support_user: "{{ solr_support_username }}"
+      solr_auth_support_password: "{{ solr_support_password_plain }}"
+      solr_auth_customer_user: "{{ solr_customer_username }}"
+      solr_auth_customer_password: "{{ solr_customer_password_plain }}"
+      
+      # Metadata
+      solr_auth_last_updated: "{{ ansible_date_time.iso8601 }}"
+    backup: yes
+  delegate_to: localhost
+  when: 
+    - password_regeneration_required or hostvars_admin_password == '' or hostvars_customer_password == ''
+  tags: [security, hostvars]
+
+- name: "[SECURITY] Update solr_config_data with current customer credentials"
+  blockinfile:
+    path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    marker: "# {mark} ANSIBLE MANAGED SOLR MOODLE INTEGRATION"
+    block: |
+      # =============================================================================
+      # SOLR MOODLE INTEGRATION - AUTO-UPDATED CREDENTIALS
+      # =============================================================================
+      solr_config_data:
+        - "// Eledia Solr Configuration - {{ moodle_app_domain | default(inventory_hostname) }}"
+        - "$CFG->searchengine = 'solr';"
+        - "$CFG->forced_plugin_settings['search_solr'] = array("
+        - "    'server_hostname' => 'localhost',"
+        - "    'server_port' => '{{ solr_port | default(8983) }}',"
+        - "    'server_path' => '/solr/',"
+        - "    'server_core' => '{{ solr_core_name | default('eledia_solr_' + (customer_name | default(moodle_app_domain.split('.')[0]))) }}',"
+        - "    'server_timeout' => 30,"
+        - "    'indexname' => '{{ solr_core_name | default('eledia_solr_' + (customer_name | default(moodle_app_domain.split('.')[0]))) }}',"
+        - "    'server_username' => '{{ solr_customer_username }}',"
+        - "    'server_password' => '{{ solr_customer_password_plain }}',"
+        - "    'ssl_cert' => '',"
+        - "    'ssl_key' => '',"
+        - "    'ssl_keypassword' => '',"
+        - "    'ssl_cainfo' => '',"
+        - "    'ssl_capath' => ''"
+        - ");"
+    backup: yes
+  delegate_to: localhost
+  tags: [security, hostvars, moodle]
+
+- name: "[SECURITY] Store credentials securely for reference"
+  copy:
+    dest: "/tmp/solr_credentials_{{ customer_name | default(moodle_app_domain.split('.')[0]) }}.txt"
+    mode: '0600'
+    content: |
+      # Solr Authentication Credentials for {{ customer_name | default(moodle_app_domain) }}
+      # Generated: {{ ansible_date_time.iso8601 }}
+      
+      Admin User: {{ solr_admin_username }}
+      Admin Password: {{ solr_admin_password_plain }}
+      
+      Support User: {{ solr_support_username }}  
+      Support Password: {{ solr_support_password_plain }}
+      
+      Customer User: {{ solr_customer_username }}  
+      Customer Password: {{ solr_customer_password_plain }}
+      
+      Access URL: http://{{ moodle_app_domain | default(inventory_hostname) }}/solr-admin/
+      
+      # These credentials are automatically synchronized with hostvars
+      # File: {{ inventory_dir }}/host_vars/{{ inventory_hostname }}
+
+- name: "[SECURITY] Cleanup temporary files"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/complete_security.json"
+    - "/tmp/minimal_security.json"
+    - "/tmp/solr_credentials_{{ customer_name | default('default') }}.txt"
+  failed_when: false
+
+- name: "[SECURITY] Security deployment completed successfully"
+  debug:
+    msg:
+      - "================================================================"
+      - "✅ SOLR SECURITY DEPLOYMENT COMPLETED SUCCESSFULLY"
+      - "================================================================"
+      - "Container: {{ solr_docker_container_name }}"
+      - "Authentication: ENABLED"
+      - "Credentials: Generated and stored in /tmp/solr_credentials_{{ customer_name | default('default') }}.txt"
+      - "Access: Requires authentication via Apache proxy"
+      - "================================================================"

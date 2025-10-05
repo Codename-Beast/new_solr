@@ -1,0 +1,274 @@
+---
+# =============================================================================
+# MULTI-TENANT CORE MANAGEMENT v3.3.1
+# Implements customer core creation with console output for admins
+# =============================================================================
+
+- name: "[MULTI-TENANT] Display server information"
+  debug:
+    msg:
+      - "🏢 Multi-Tenant Solr Server Ready"
+      - "Server: {{ ansible_fqdn }} ({{ ansible_default_ipv4.address }})"
+      - "Port: {{ solr_docker_port }}"
+      - "External Access: {{ solr_multi_tenant_bind }}:{{ solr_docker_port }}"
+  when: add_solr_core == ""
+
+- name: "[MULTI-TENANT] Add new customer core"
+  block:
+    - name: "[CORE-ADD] Validate customer hostvars file"
+      stat:
+        path: "{{ kunden_moodle_hostvars }}"
+      register: customer_hostvars_check
+      delegate_to: localhost
+
+    - name: "[CORE-ADD] Fail if customer hostvars not found"
+      fail:
+        msg: "Customer hostvars file not found: {{ kunden_moodle_hostvars }}"
+      when: not customer_hostvars_check.stat.exists
+
+    - name: "[CORE-ADD] Load customer configuration"
+      include_vars:
+        file: "{{ kunden_moodle_hostvars }}"
+        name: customer_config
+
+    - name: "[CORE-ADD] Generate secure customer password"
+      set_fact:
+        customer_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits,!@#$%^&*') }}"
+
+    - name: "[CORE-ADD] Create customer core using solr create_core command"
+      shell: |
+        docker exec {{ solr_docker_container_name }} bash -c "
+        # Fix ownership first
+        chown -R solr:solr /var/solr/data
+        
+        # Generate core name
+        CORE_NAME='eledia_solr_{{ add_solr_core | regex_replace('[^a-zA-Z0-9]', '_') | lower }}'
+        
+        # Create core using solr command as solr user
+        su - solr -c \"/opt/solr/bin/solr create_core -c \$CORE_NAME -d basic_configs\"
+        
+        # Output success message as JSON
+        echo '{\"status\":\"success\",\"core_name\":\"'\$CORE_NAME'\",\"username\":\"{{ customer_config.customer_name | default(add_solr_core.split('.')[0]) }}\"}'
+        "
+      register: customer_core_creation
+
+    - name: "[CORE-ADD] Parse core creation result"
+      set_fact:
+        new_customer_core: "{{ customer_core_creation.stdout_lines[-1] | from_json }}"
+      when: 
+        - customer_core_creation.rc == 0
+        - customer_core_creation.stdout_lines is defined
+        - customer_core_creation.stdout_lines | length > 0
+
+    - name: "[CORE-ADD] Fail if core creation failed"
+      fail:
+        msg: "Core creation failed: {{ customer_core_creation.stderr | default('Unknown error') }}"
+      when: 
+        - customer_core_creation.rc != 0 or new_customer_core is not defined or new_customer_core.status != "success"
+
+    - name: "[CORE-ADD] Test customer core endpoints"
+      uri:
+        url: "{{ item.url }}"
+        method: "{{ item.method }}"
+        user: "{{ new_customer_core.username }}"
+        password: "{{ customer_password }}"
+        force_basic_auth: yes
+        status_code: "{{ item.expected_status }}"
+        timeout: 10
+      register: core_endpoint_tests
+      loop:
+        - { 
+            url: "http://{{ ansible_default_ipv4.address }}:{{ solr_docker_port }}/solr/{{ new_customer_core.core_name }}/admin/ping", 
+            method: "GET", 
+            expected_status: 200,
+            description: "Ping Test"
+          }
+        - { 
+            url: "http://{{ ansible_default_ipv4.address }}:{{ solr_docker_port }}/solr/{{ new_customer_core.core_name }}/select?q=*:*&rows=0&wt=json", 
+            method: "GET", 
+            expected_status: 200,
+            description: "Search Test"
+          }
+      loop_control:
+        label: "{{ item.description }}"
+
+    - name: "[CORE-ADD] Generate customer access configuration"
+      set_fact:
+        customer_solr_config:
+          server_hostname: "{{ ansible_fqdn }}"
+          server_ip: "{{ ansible_default_ipv4.address }}"
+          server_port: "{{ solr_docker_port }}"
+          core_name: "{{ new_customer_core.core_name }}"
+          username: "{{ new_customer_core.username }}"
+          password: "{{ customer_password }}"
+          moodle_version: "{{ customer_config.moodle_version | default('45') }}"
+          customer_domain: "{{ customer_config.moodle_app_domain | default(add_solr_core) }}"
+          creation_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+    - name: "[CORE-ADD] 🎉 CUSTOMER CORE SUCCESSFULLY CREATED"
+      debug:
+        msg:
+          - ""
+          - "████████████████████████████████████████████████████████████████████████████████"
+          - "🎉 NEW CUSTOMER CORE CREATED SUCCESSFULLY!"
+          - "████████████████████████████████████████████████████████████████████████████████"
+          - ""
+          - "📋 CUSTOMER INFORMATION:"
+          - "   Customer Name: {{ add_solr_core }}"
+          - "   Domain: {{ customer_solr_config.customer_domain }}"
+          - "   Moodle Version: {{ customer_solr_config.moodle_version }}"
+          - "   Creation Time: {{ customer_solr_config.creation_timestamp }}"
+          - ""
+          - "🔧 SOLR CONNECTION DETAILS:"
+          - "   Server Hostname: {{ customer_solr_config.server_hostname }}"
+          - "   Server IP: {{ customer_solr_config.server_ip }}"
+          - "   Port: {{ customer_solr_config.server_port }}"
+          - "   Core Name: {{ customer_solr_config.core_name }}"
+          - "   Username: {{ customer_solr_config.username }}"
+          - "   Password: {{ customer_solr_config.password }}"
+          - ""
+          - "🌐 CORE ENDPOINTS:"
+          - "   Admin: http://{{ customer_solr_config.server_hostname }}:{{ customer_solr_config.server_port }}/solr/#/{{ customer_solr_config.core_name }}"
+          - "   API: http://{{ customer_solr_config.server_hostname }}:{{ customer_solr_config.server_port }}/solr/{{ customer_solr_config.core_name }}"
+          - ""
+          - "✅ ENDPOINT TESTS:"
+          - "   Ping Test: {{ 'PASSED' if core_endpoint_tests.results[0].status == 200 else 'FAILED' }}"
+          - "   Search Test: {{ 'PASSED' if core_endpoint_tests.results[1].status == 200 else 'FAILED' }}"
+          - ""
+
+    - name: "[CORE-ADD] 📝 HOSTVARS CONFIGURATION TO COPY"
+      debug:
+        msg:
+          - "████████████████████████████████████████████████████████████████████████████████"
+          - "📝 COPY THIS CONFIGURATION TO CUSTOMER HOSTVARS FILE:"
+          - "File: {{ kunden_moodle_hostvars }}"
+          - "████████████████████████████████████████████████████████████████████████████████"
+          - ""
+          - "# ============================================================================="
+          - "# SOLR CONFIGURATION FOR {{ add_solr_core | upper }}"
+          - "# Generated: {{ customer_solr_config.creation_timestamp }}"
+          - "# Solr Server: {{ customer_solr_config.server_hostname }} ({{ customer_solr_config.server_ip }})"
+          - "# ============================================================================="
+          - ""
+          - "# Solr Configuration (add to existing hostvars)"
+          - "solr_config_data:"
+          - "  - \"// Eledia Solr Configuration - {{ customer_solr_config.customer_domain }}\""
+          - "  - \"// Generated: {{ customer_solr_config.creation_timestamp }}\""
+          - "  - \"$CFG->searchengine = 'solr';\""
+          - "  - \"$CFG->forced_plugin_settings['search_solr'] = array(\""
+          - "  - \"    'server_hostname' => '{{ customer_solr_config.server_hostname }}',\""
+          - "  - \"    'server_port' => '{{ customer_solr_config.server_port }}',\""
+          - "  - \"    'server_path' => '/solr/',\""
+          - "  - \"    'server_core' => '{{ customer_solr_config.core_name }}',\""
+          - "  - \"    'server_timeout' => 30,\""
+          - "  - \"    'indexname' => '{{ customer_solr_config.core_name }}',\""
+          - "  - \"    'server_username' => '{{ customer_solr_config.username }}',\""
+          - "  - \"    'server_password' => '{{ customer_solr_config.password }}',\""
+          - "  - \"    'ssl_cert' => '',\""
+          - "  - \"    'ssl_key' => '',\""
+          - "  - \"    'ssl_keypassword' => '',\""
+          - "  - \"    'ssl_cainfo' => '',\""
+          - "  - \"    'ssl_capath' => ''\""
+          - "  - \");\""
+          - ""
+          - "# Integration with existing config (merge with additional_config_data)"
+          - "additional_config_data: \"{{ '{{' }} (additional_config_data | default([])) + (solr_config_data | default([])) {{ '}}' }}\""
+          - ""
+
+    - name: "[CORE-ADD] 🚀 NEXT STEPS"
+      debug:
+        msg:
+          - "████████████████████████████████████████████████████████████████████████████████"
+          - "🚀 NEXT STEPS FOR DEPLOYMENT:"
+          - "████████████████████████████████████████████████████████████████████████████████"
+          - ""
+          - "1. 📋 Copy the configuration above to:"
+          - "   {{ kunden_moodle_hostvars }}"
+          - ""
+          - "2. 🔄 Deploy Moodle configuration:"
+          - "   ansible-playbook update-config-php.yml -e \"hosts={{ customer_config.inventory_hostname | default('CUSTOMER_HOST') }}\""
+          - ""
+          - "3. 🔍 Test search functionality:"
+          - "   - Login to Moodle as admin"
+          - "   - Go to Site Administration > Plugins > Search > Manage global search"
+          - "   - Enable global search and test indexing"
+          - ""
+          - "4. 🌐 Verify Solr connection:"
+          - "   curl -u '{{ customer_solr_config.username }}:{{ customer_solr_config.password }}' \\"
+          - "   'http://{{ customer_solr_config.server_hostname }}:{{ customer_solr_config.server_port }}/solr/{{ customer_solr_config.core_name }}/admin/ping'"
+          - ""
+          - "████████████████████████████████████████████████████████████████████████████████"
+
+  when: add_solr_core != ""
+
+# =============================================================================
+# CORE RELOAD FUNCTIONALITY
+# =============================================================================
+- name: "[CORE-RELOAD] Reload specific core"
+  block:
+    - name: "[CORE-RELOAD] List current cores"
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:{{ solr_docker_port }}/solr/admin/cores?action=STATUS"
+        method: GET
+        user: "admin"
+        password: "SolrSecure2024!@#"
+        force_basic_auth: yes
+        return_content: yes
+      register: cores_status
+
+    - name: "[CORE-RELOAD] Reload core configuration"
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:{{ solr_docker_port }}/solr/admin/cores?action=RELOAD&core={{ reload_solr_core }}"
+        method: GET
+        user: "admin"
+        password: "SolrSecure2024!@#"
+        force_basic_auth: yes
+        status_code: 200
+      register: core_reload_result
+
+    - name: "[CORE-RELOAD] ✅ CORE SUCCESSFULLY RELOADED"
+      debug:
+        msg:
+          - "✅ Core '{{ reload_solr_core }}' successfully reloaded"
+          - "Server: {{ ansible_fqdn }}"
+          - "Reload Time: {{ ansible_date_time.iso8601 }}"
+
+  when: reload_solr_core != ""
+
+# =============================================================================
+# CORE REMOVAL FUNCTIONALITY  
+# =============================================================================
+- name: "[CORE-REMOVE] Remove customer core"
+  block:
+    - name: "[CORE-REMOVE] Confirm removal (unless forced)"
+      pause:
+        prompt: "⚠️  Are you sure you want to remove core '{{ remove_solr_core }}'? This will delete all data! (y/N)"
+      register: removal_confirmation
+      when: not (force_core_removal | default(false))
+
+    - name: "[CORE-REMOVE] Abort if not confirmed"
+      fail:
+        msg: "Core removal aborted by user"
+      when: 
+        - not (force_core_removal | default(false))
+        - removal_confirmation.user_input | lower != 'y'
+
+    - name: "[CORE-REMOVE] Remove core and data"
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:{{ solr_docker_port }}/solr/admin/cores?action=UNLOAD&core={{ remove_solr_core }}&deleteIndex=true&deleteDataDir=true&deleteInstanceDir=true"
+        method: GET
+        user: "admin"
+        password: "SolrSecure2024!@#"
+        force_basic_auth: yes
+        status_code: 200
+      register: core_removal_result
+
+    - name: "[CORE-REMOVE] ✅ CORE SUCCESSFULLY REMOVED"
+      debug:
+        msg:
+          - "✅ Core '{{ remove_solr_core }}' successfully removed"
+          - "Server: {{ ansible_fqdn }}"
+          - "Removal Time: {{ ansible_date_time.iso8601 }}"
+          - "⚠️  All data has been permanently deleted"
+
+  when: remove_solr_core != ""

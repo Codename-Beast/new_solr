@@ -1,0 +1,233 @@
+---
+# =============================================================================
+# SOLR CORE TESTING WITH MOODLE-LIKE DOCUMENTS
+# Maintainer: Bernd Schreistetter, Eledia GmbH
+# Description: Test Solr core functionality with realistic Moodle documents
+# =============================================================================
+# CORE CONNECTIVITY TEST
+# =============================================================================
+- name: "[TEST] Check if Solr core is accessible"
+  uri:
+    url: "http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}/admin/ping"
+    method: GET
+    user: "{{ solr_auth_admin_user | default('admin') if (solr_auth_enabled | default(false) | bool) else omit }}"
+    password: "{{ solr_auth_admin_password if (solr_auth_enabled | default(false) | bool) else omit }}"
+    force_basic_auth: "{{ solr_auth_enabled | default(false) | bool }}"
+    timeout: 10
+  register: core_ping_test
+  ignore_errors: true
+
+- name: "[TEST] Display core accessibility result"
+  debug:
+    msg: 
+      - "🔍 Core Ping Test: {{ '✅ SUCCESS' if core_ping_test.status == 200 else '❌ FAILED' }}"
+      - "Status Code: {{ core_ping_test.status | default('N/A') }}"
+  when: core_ping_test is defined
+
+# =============================================================================
+# MOODLE-LIKE TEST DOCUMENTS
+# =============================================================================
+- name: "[TEST] Define Moodle-like test documents"
+  set_fact:
+    moodle_test_documents:
+      - id: "course_1"
+        title: "Einführung in die Informatik"
+        content: "Grundlagen der Programmierung, Algorithmen und Datenstrukturen. Dieses Modul behandelt die Basis-Konzepte der Informatik."
+        type: "course"
+        category: "Informatik"
+        author: "Prof. Dr. Müller"
+        areaid: "1"
+        courseid: "101"
+        contextid: "1001"
+        userid: "10"
+        owneruserid: "10"
+        modified: "{{ ansible_date_time.epoch }}"
+      - id: "forum_post_1"
+        title: "Frage zu Algorithmen"
+        content: "Kann mir jemand den Unterschied zwischen Bubble Sort und Quick Sort erklären? Welcher Algorithmus ist effizienter?"
+        type: "forum"
+        category: "Diskussion"
+        author: "student123"
+        areaid: "2"
+        courseid: "101"
+        contextid: "2001"
+        userid: "25"
+        owneruserid: "25"
+        modified: "{{ ansible_date_time.epoch }}"
+      - id: "wiki_1"
+        title: "Java Programmierung Wiki"
+        content: "Java ist eine objektorientierte Programmiersprache. Hier sammeln wir wichtige Konzepte: Klassen, Objekte, Vererbung, Polymorphismus."
+        type: "wiki"
+        category: "Dokumentation"
+        author: "tutor_anna"
+        areaid: "3"
+        courseid: "101"
+        contextid: "3001"
+        userid: "15"
+        owneruserid: "15"
+        modified: "{{ ansible_date_time.epoch }}"
+      - id: "assignment_1"
+        title: "Hausaufgabe: Sortier-Algorithmus implementieren"
+        content: "Implementieren Sie einen effizienten Sortier-Algorithmus in Java. Vergleichen Sie die Laufzeit mit anderen Algorithmen."
+        type: "assignment"
+        category: "Aufgabe"
+        author: "Prof. Dr. Müller"
+        areaid: "4"
+        courseid: "101"
+        contextid: "4001"
+        userid: "10"
+        owneruserid: "10"
+        modified: "{{ ansible_date_time.epoch }}"
+      - id: "resource_1"
+        title: "Lehrbuch: Algorithmen und Datenstrukturen"
+        content: "Umfassendes Lehrbuch über Algorithmen, Komplexitätstheorie und Datenstrukturen. PDF verfügbar zum Download."
+        type: "resource"
+        category: "Material"
+        author: "Prof. Dr. Schmidt"
+        areaid: "5"
+        courseid: "101"
+        contextid: "5001"
+        userid: "10"
+        owneruserid: "10"
+        modified: "{{ ansible_date_time.epoch }}"
+
+# =============================================================================
+# DOCUMENT INDEXING TEST
+# =============================================================================
+- name: "[TEST] Index test documents in Solr"
+  uri:
+    url: "http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}/update?commit=true"
+    method: POST
+    user: "{{ solr_auth_admin_user | default('admin') if (solr_auth_enabled | default(false) | bool) else omit }}"
+    password: "{{ solr_auth_admin_password if (solr_auth_enabled | default(false) | bool) else omit }}"
+    force_basic_auth: "{{ solr_auth_enabled | default(false) | bool }}"
+    body_format: json
+    body: "{{ moodle_test_documents }}"
+    headers:
+      Content-Type: "application/json"
+    timeout: 30
+  register: indexing_test
+
+- name: "[TEST] Display indexing result"
+  debug:
+    msg:
+      - "📝 Document Indexing Test: {{ '✅ SUCCESS' if indexing_test.status == 200 else '❌ FAILED' }}"
+      - "Status Code: {{ indexing_test.status | default('N/A') }}"
+      - "Documents indexed: {{ moodle_test_documents | length }}"
+
+# =============================================================================
+# SEARCH FUNCTIONALITY TESTS
+# =============================================================================
+- name: "[TEST] Search test 1: Simple text search"
+  uri:
+    url: "http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}/select"
+    method: GET
+    user: "{{ solr_auth_admin_user | default('admin') if (solr_auth_enabled | default(false) | bool) else omit }}"
+    password: "{{ solr_auth_admin_password if (solr_auth_enabled | default(false) | bool) else omit }}"
+    force_basic_auth: "{{ solr_auth_enabled | default(false) | bool }}"
+    body_format: form-urlencoded
+    body:
+      q: "Algorithmen"
+      wt: "json"
+      rows: "10"
+    timeout: 10
+  register: search_test_1
+
+- name: "[TEST] Search test 2: Course-specific search"
+  uri:
+    url: "http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}/select"
+    method: GET
+    user: "{{ solr_auth_admin_user | default('admin') if (solr_auth_enabled | default(false) | bool) else omit }}"
+    password: "{{ solr_auth_admin_password if (solr_auth_enabled | default(false) | bool) else omit }}"
+    force_basic_auth: "{{ solr_auth_enabled | default(false) | bool }}"
+    body_format: form-urlencoded
+    body:
+      q: "courseid:101"
+      wt: "json"
+      rows: "5"
+    timeout: 10
+  register: search_test_2
+
+- name: "[TEST] Search test 3: Content type filter"
+  uri:
+    url: "http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}/select"
+    method: GET
+    user: "{{ solr_auth_admin_user | default('admin') if (solr_auth_enabled | default(false) | bool) else omit }}"
+    password: "{{ solr_auth_admin_password if (solr_auth_enabled | default(false) | bool) else omit }}"
+    force_basic_auth: "{{ solr_auth_enabled | default(false) | bool }}"
+    body_format: form-urlencoded
+    body:
+      q: "type:forum"
+      wt: "json"
+      rows: "5"
+    timeout: 10
+  register: search_test_3
+
+# =============================================================================
+# CORE STATISTICS AND PERFORMANCE
+# =============================================================================
+- name: "[TEST] Get core statistics"
+  uri:
+    url: "http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}/admin/stats"
+    method: GET
+    user: "{{ solr_auth_admin_user | default('admin') if (solr_auth_enabled | default(false) | bool) else omit }}"
+    password: "{{ solr_auth_admin_password if (solr_auth_enabled | default(false) | bool) else omit }}"
+    force_basic_auth: "{{ solr_auth_enabled | default(false) | bool }}"
+    timeout: 10
+  register: core_stats
+
+# =============================================================================
+# TEST RESULTS
+# =============================================================================
+- name: "[TEST] Display test results"
+  debug:
+    msg:
+      - "================================================================"
+      - "🧪 SOLR CORE FUNCTIONALITY TEST RESULTS"
+      - "================================================================"
+      - ""
+      - "📊 Core Tests:"
+      - "  - Core Ping: {{ '✅ OK' if core_ping_test.status == 200 else '❌ FAILED' }}"
+      - "  - Document Indexing: {{ '✅ OK' if indexing_test.status == 200 else '❌ FAILED' }}"
+      - "  - Core Statistics: {{ '✅ OK' if core_stats.status == 200 else '❌ FAILED' }}"
+      - ""
+      - "🔍 Search Tests:"
+      - "  - Text Search (Algorithmen): {{ '✅ OK (' + (search_test_1.json.response.numFound | string) + ' docs)' if search_test_1.status == 200 else '❌ FAILED' }}"
+      - "  - Course Filter (courseid:101): {{ '✅ OK (' + (search_test_2.json.response.numFound | string) + ' docs)' if search_test_2.status == 200 else '❌ FAILED' }}"
+      - "  - Type Filter (type:forum): {{ '✅ OK (' + (search_test_3.json.response.numFound | string) + ' docs)' if search_test_3.status == 200 else '❌ FAILED' }}"
+      - ""
+      - "📈 Performance Metrics:"
+      - "  - Query Time: {{ search_test_1.json.responseHeader.QTime | default('N/A') }}ms"
+      - "  - Total Documents: {{ search_test_1.json.response.numFound | default('N/A') if search_test_1.status == 200 else 'N/A' }}"
+      - ""
+      - "✅ Test Documents Created:"
+      - "  - Course: Einführung in die Informatik"
+      - "  - Forum Post: Frage zu Algorithmen"
+      - "  - Wiki: Java Programmierung Wiki"
+      - "  - Assignment: Sortier-Algorithmus implementieren"
+      - "  - Resource: Lehrbuch Algorithmen"
+      - ""
+      - "🎯 Overall Status: {{ '✅ ALL TESTS PASSED' if (core_ping_test.status == 200 and indexing_test.status == 200 and search_test_1.status == 200) else '⚠️ SOME TESTS FAILED' }}"
+      - "================================================================"
+
+# =============================================================================
+# CLEANUP OPTION
+# =============================================================================
+- name: "[TEST] Clean up test documents (optional)"
+  uri:
+    url: "http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}/update?commit=true"
+    method: POST
+    user: "{{ solr_auth_admin_user | default('admin') if (solr_auth_enabled | default(false) | bool) else omit }}"
+    password: "{{ solr_auth_admin_password if (solr_auth_enabled | default(false) | bool) else omit }}"
+    force_basic_auth: "{{ solr_auth_enabled | default(false) | bool }}"
+    body: '<delete><query>id:(course_1 OR forum_post_1 OR wiki_1 OR assignment_1 OR resource_1)</query></delete>'
+    headers:
+      Content-Type: "application/xml"
+    timeout: 10
+  register: cleanup_test
+  when: cleanup_test_documents | default(false) | bool
+
+- name: "[TEST] Display cleanup result"
+  debug:
+    msg: "🧹 Test documents cleaned up: {{ '✅ SUCCESS' if cleanup_test.status == 200 else '❌ FAILED' }}"
+  when: cleanup_test_documents | default(false) | bool and cleanup_test is defined

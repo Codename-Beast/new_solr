@@ -1,0 +1,99 @@
+---
+# =============================================================================
+# SMART BACKUP & RECOVERY SYSTEM
+# Version: 1.0 - Auto Recovery on Deployment Failure
+# Maintainer: Bernd Schreistetter, Eledia GmbH
+# Description: Intelligent backup management with automatic rollback
+# =============================================================================
+
+# This task is designed to be called from error handlers and finalization
+# It manages the smart backup system with automatic recovery
+
+- name: "[RECOVERY] Check if backup restoration is needed"
+  stat:
+    path: "{{ solr_backup_file | default('') }}"
+  register: backup_file_exists
+  delegate_to: localhost
+  when: 
+    - solr_backup_file is defined
+    - ansible_failed_task is defined
+  tags: [recovery, cleanup, always]
+
+- name: "[RECOVERY] Restore from backup on deployment failure"
+  copy:
+    src: "{{ solr_backup_file }}"
+    dest: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    backup: no
+  delegate_to: localhost
+  when:
+    - solr_backup_file is defined
+    - backup_file_exists.stat.exists | default(false)
+    - ansible_failed_task is defined
+  register: backup_restored
+  tags: [recovery, cleanup, always]
+
+- name: "[RECOVERY] Display backup restoration message"
+  debug:
+    msg:
+      - "🔄 BACKUP RESTORATION COMPLETED"
+      - "Original hostvars file restored due to deployment failure"
+      - "Backup file: {{ solr_backup_file }}"
+      - "Failed task: {{ ansible_failed_task.name | default('Unknown') }}"
+      - "System restored to previous working state"
+  when:
+    - backup_restored is defined
+    - backup_restored.changed
+  tags: [recovery, cleanup, always]
+
+- name: "[CLEANUP] Remove backup file on successful deployment"
+  file:
+    path: "{{ solr_backup_file }}"
+    state: absent
+  delegate_to: localhost
+  when:
+    - solr_backup_file is defined
+    - solr_deployment_success | default(false)
+    - ansible_failed_task is not defined
+  register: backup_cleaned
+  tags: [cleanup, finalize, always]
+
+- name: "[CLEANUP] Display successful cleanup message"
+  debug:
+    msg:
+      - "✅ BACKUP CLEANUP COMPLETED"
+      - "Deployment successful - backup file removed"
+      - "Smart backup system maintained clean inventory"
+  when:
+    - backup_cleaned is defined
+    - backup_cleaned.changed
+  tags: [cleanup, finalize, always]
+
+- name: "[CLEANUP] Check for old backup files to clean up"
+  find:
+    paths: "{{ inventory_dir }}/host_vars/"
+    patterns: "{{ inventory_hostname }}.backup.*"
+    age: "1d"
+  register: old_backup_files
+  delegate_to: localhost
+  tags: [cleanup, maintenance, always]
+
+- name: "[CLEANUP] Remove old backup files (older than 1 day)"
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  delegate_to: localhost
+  loop: "{{ old_backup_files.files }}"
+  when: old_backup_files.files | length > 0
+  register: old_backups_cleaned
+  tags: [cleanup, maintenance, always]
+
+- name: "[CLEANUP] Display old backup cleanup results"
+  debug:
+    msg:
+      - "🧹 OLD BACKUP CLEANUP"
+      - "Removed {{ old_backup_files.files | length }} old backup files"
+      - "Smart backup system prevents accumulation of backup files"
+  when: 
+    - old_backup_files.files | length > 0
+    - old_backups_cleaned is defined
+  tags: [cleanup, maintenance, always]

@@ -1,0 +1,218 @@
+---
+# =============================================================================
+# ELEDIA SOLR INSTALLATION
+# Maintainer: Bernd Schreistetter, Eledia GmbH
+# Description: Solr deployment for Moodle integration
+# =============================================================================
+
+# =============================================================================
+# EARLY INITIALIZATION FOR BANNER
+# =============================================================================
+- name: "[INIT] Early system type detection for banner"
+  set_fact:
+    detected_system_types: "{{ hostvars[inventory_hostname].system_type | default([]) }}"
+    detected_system_types_lower: "{{ (hostvars[inventory_hostname].system_type | default([])) | map('lower') | list }}"
+    early_solr_is_single_tenant: >-
+      {{ 
+        (solr_server_mode | default('') == 'single-tenant') or 
+        ('moodle' in ((hostvars[inventory_hostname].system_type | default([])) | map('lower') | list) and solr_server_mode | default('') != 'multi-tenant') 
+      }}
+    early_solr_is_multi_tenant: >-
+      {{ 
+        (solr_server_mode | default('') == 'multi-tenant') or 
+        ('solr' in ((hostvars[inventory_hostname].system_type | default([])) | map('lower') | list) and 'moodle' not in ((hostvars[inventory_hostname].system_type | default([])) | map('lower') | list) and solr_server_mode | default('') != 'single-tenant') 
+      }}
+  tags: [always, validation]
+
+- name: "[INIT] Eledia Solr Installation Banner"
+  debug:
+    msg:
+      - "================================================================"
+      - "🚀 ELEDIA SOLR INSTALLATION v3.3.1 (Docker-First)"
+      - "================================================================"
+      - "Host: {{ inventory_hostname }}"
+      - "System Types: {{ detected_system_types | default(['Unknown']) }}"
+      - "Mode: {{ 'Single-Tenant (Moodle)' if early_solr_is_single_tenant else 'Multi-Tenant (Solr Server)' }}"
+      - "Container: {{ solr_docker_container_name | default('eledia-solr-' + inventory_hostname) }}"
+      - "Port: {{ solr_docker_port | default('8983') }}"
+      - "Memory: {{ solr_docker_memory | default('2g') }}"
+      - "Auth: ENABLED"
+      - "Override Mode: {{ solr_server_mode | default('Auto-Detect') }}"
+      - "================================================================"
+  tags: [always, validation]
+
+# =============================================================================
+# VALIDATION & SYSTEM TYPE DETECTION
+# =============================================================================
+- name: "[VALIDATION] Prevent Multi-Tenant installation on xen systems"
+  fail:
+    msg: |
+      ❌ MULTI-TENANT INSTALLATION NOT ALLOWED ON XEN SYSTEMS
+      ================================================================
+      Host: {{ inventory_hostname }}
+      Requested Mode: Multi-Tenant
+      ERROR: xen-* systems are reserved for Single-Tenant Moodle installations only
+      ================================================================
+      SOLUTION: Use a dedicated Solr server for Multi-Tenant installations
+      Examples: solr-server.eledia.de, solr-multi-tenant.eledia.de
+      ================================================================
+  when: 
+    - early_solr_is_multi_tenant
+    - inventory_hostname is regex("^xen-.*")
+  tags: [validation]
+
+- name: "[VALIDATION] Validate system_type configuration"
+  fail:
+    msg: "Invalid system_type configuration. Must contain 'moodle'/'Moodle' for single-tenant or 'solr'/'Solr' (without moodle) for multi-tenant. Current: {{ solr_system_types }}"
+  when: 
+    - not solr_is_single_tenant
+    - not solr_is_multi_tenant
+  tags: [validation]
+
+- name: "[VALIDATION] Validate single-tenant requirements"
+  fail:
+    msg: "Single-tenant mode requires moodle_app_domain to be defined"
+  when: 
+    - solr_is_single_tenant
+    - moodle_app_domain is not defined or moodle_app_domain == ""
+  tags: [validation]
+
+- name: "[VALIDATION] Validate multi-tenant core addition parameters"
+  fail:
+    msg: "Multi-tenant core addition requires: add_solr_core, kunden_moodle_hostvars, and solr_server_hostvars"
+  when:
+    - add_solr_core != ""
+    - (kunden_moodle_hostvars == "" or solr_server_hostvars == "")
+  tags: [validation]
+
+# =============================================================================
+# HOST_VARS DUPLICATE CLEANUP (FIRST PRIORITY)
+# =============================================================================
+- name: "Host_vars Duplicate Solr Configuration Cleanup - Preventive Maintenance"
+  include_tasks: cleanup_duplicates.yml
+  tags: [always, cleanup, validation]
+
+# =============================================================================
+#  SYSTEM PREPARATION AND VALIDATION  
+# =============================================================================
+- name: "System Preparation and Validation"
+  include_tasks: system_preparation.yml
+  tags: [always, facts, preflight, detection, moodle]
+
+# =============================================================================
+# DOCKER-FIRST DEPLOYMENT v3.3.1
+# =============================================================================
+- name: "Docker-Based Solr Deployment v3.3.1"
+  include_tasks: docker_deployment.yml
+  vars:
+    deployment_mode: "{{ 'single_tenant' if solr_is_single_tenant else 'multi_tenant' }}"
+  when: not (skip_solr_installation | default(false))
+  tags: [always, docker, installation, deployment]
+
+# =============================================================================
+# MULTI-TENANT CORE MANAGEMENT
+# =============================================================================
+- name: "Multi-Tenant Core Management"
+  include_tasks: multi_tenant_core_management.yml
+  when:
+    - solr_is_multi_tenant
+    - (add_solr_core != "" or reload_solr_core != "" or remove_solr_core != "")
+    - not (skip_solr_installation | default(false))
+  tags: [multi-tenant, core-management, customer]
+
+# =============================================================================
+# MULTI-TENANT CORE REMOVAL
+# =============================================================================
+- name: "Multi-Tenant Core Removal"
+  include_tasks: multi_tenant_core_removal.yml
+  when:
+    - solr_is_multi_tenant
+    - remove_solr_core != ""
+    - remove_solr_core is defined
+  tags: [multi-tenant, core-removal, customer]
+
+# =============================================================================
+#  MOODLE INTEGRATION (Single-Tenant Only)
+# =============================================================================
+- name: "Moodle-Solr Integration"
+  include_tasks: moodle_integration.yml
+  when: 
+    - solr_is_single_tenant
+    - not (manual_config_only | default(false))
+  tags: [moodle, integration, config, single-tenant]
+
+# =============================================================================
+# MANUAL CONFIG OUTPUT (Fallback Option)
+# =============================================================================
+- name: "Manual Configuration Output"
+  include_tasks: manual_config_output.yml
+  when: manual_config_only | default(false) | bool
+  tags: [manual-config, config-output, never]
+
+# =============================================================================
+# CORE FUNCTIONALITY TESTING
+# =============================================================================
+- name: "[TEST] Core Functionality Testing with Moodle Documents"
+  include_tasks: core_testing.yml
+  when: perform_core_testing | default(false) | bool
+  tags: [test, core-test, validation, never]
+
+# =============================================================================
+# FINALIZATION AND SUMMARY
+# =============================================================================
+- name: "install-solr - Installation Finalization"
+  include_tasks: finalization.yml
+  tags: [finalize, summary]
+
+# =============================================================================
+# BACKUP & RECOVERY SYSTEM
+# =============================================================================
+- block:
+  - name: "[SUCCESS] Mark deployment as successful for backup cleanup"
+    set_fact:
+      solr_deployment_success: true
+    
+  - name: "Smart Backup & Recovery Management"
+    include_tasks: backup_recovery.yml
+    tags: [cleanup, finalize, recovery]
+    
+  rescue:
+  - name: "[ERROR] Handle deployment failure with backup recovery"
+    include_tasks: backup_recovery.yml
+    tags: [recovery, cleanup]
+    
+  - name: "[ERROR] Re-raise the original error after recovery"
+    fail:
+      msg: "Deployment failed, but backup has been restored. Original error: {{ ansible_failed_result.msg | default('Unknown error') }}"
+  
+  always:
+  - name: "[CLEANUP] Final backup cleanup regardless of success/failure"
+    include_tasks: backup_recovery.yml
+    tags: [cleanup, finalize]
+
+# =============================================================================
+# APACHE WEB-UI INTEGRATION (Optional)
+# =============================================================================
+- name: "Apache Solr Web-UI Integration"
+  include_tasks: apache_integration.yml
+  when: 
+    - enable_solr_web_ui | default(false) | bool
+    - moodle_app_domain is defined
+  tags: [apache, web-ui, never]
+
+# =============================================================================
+# MANAGEMENT TASKS (ON DEMAND ONLY)
+# =============================================================================
+- name: "install-solr - System Uninstall"
+  include_tasks: uninstall.yml
+  tags: [uninstall, rollback, never]
+
+- name: "install-solr - Status Check"
+  include_tasks: status.yml
+  when: "'status' in ansible_run_tags"
+  tags: [status, never]
+
+- name: "install-solr - Analysis"
+  include_tasks: dry_run.yml
+  when: solr_dry_run_mode | default(false)
+  tags: [dry-run, analysis, never]

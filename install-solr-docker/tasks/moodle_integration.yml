@@ -1,0 +1,126 @@
+---
+# =============================================================================
+# MOODLE-SOLR INTEGRATION
+# Version: 7.0
+# Maintainer: Bernd Schreistetter, Eledia GmbH
+# Description: Complete Moodle integration with solr_auth_* variables
+# =============================================================================
+
+# =============================================================================
+# MOODLE INTEGRATION PASSWORD MANAGEMENT
+# =============================================================================
+- name: "[MOODLE] Use existing credentials from security management"
+  set_fact:
+    integration_solr_password: "{{ solr_customer_password_plain | default(solr_auth_customer_password | default('')) }}"
+    integration_solr_user: "{{ solr_customer_username | default(solr_auth_customer_user | default(customer_name | default(moodle_app_domain.split('.')[0]))) }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: "[MOODLE] Generate fallback password only if no security credentials exist"
+  set_fact:
+    integration_solr_password: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=16') }}"
+  delegate_to: localhost
+  run_once: true
+  when: integration_solr_password == '' or integration_solr_password is not defined
+
+# =============================================================================
+# MOODLE SOLR CONFIGURATION GENERATION
+# =============================================================================
+- name: "[MOODLE] Build Solr configuration for Moodle integration (solr_config_data)"
+  set_fact:
+    moodle_solr_config:
+      - "// Eledia Solr Configuration - {{ moodle_app_domain | default(inventory_hostname) }}"
+      - "$CFG->searchengine = 'solr';"
+      - "$CFG->forced_plugin_settings['search_solr'] = array("
+      - "    'server_hostname' => 'localhost',"
+      - "    'server_port' => '{{ solr_port | default(8983) }}',"
+      - "    'server_path' => '/solr/',"
+      - "    'server_core' => '{{ solr_core_name }}',"
+      - "    'server_timeout' => 30,"
+      - "    'indexname' => '{{ solr_core_name }}',"
+      - "    'server_username' => '{{ integration_solr_user }}',"
+      - "    'server_password' => '{{ integration_solr_password }}',"
+      - "    'ssl_cert' => '',"
+      - "    'ssl_key' => '',"
+      - "    'ssl_keypassword' => '',"
+      - "    'ssl_cainfo' => '',"
+      - "    'ssl_capath' => ''"
+      - ");"
+  delegate_to: localhost
+  run_once: true
+
+# =============================================================================
+# HOST_VARS CONFIGURATION UPDATE
+# =============================================================================
+- name: "[MOODLE] Update essential Solr variables in host_vars"
+  blockinfile:
+    path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    marker: "# {mark} ANSIBLE MANAGED Essential Solr Variables"
+    block: |
+      # Essential Solr Configuration - Generated {{ ansible_date_time.iso8601 }}
+      solr_port: {{ solr_port | default(8983) }}
+      solr_core_name: "{{ solr_core_name }}"
+      solr_container_name: "{{ solr_container_name }}"
+      solr_auth_enabled: {{ solr_auth_enabled | default(false) | bool | lower }}
+    insertafter: EOF
+    create: true
+  delegate_to: localhost
+  run_once: true
+
+- name: "[MOODLE] Update solr_config_data in host_vars"
+  blockinfile:
+    path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    marker: "# {mark} ANSIBLE MANAGED Solr Configuration BLOCK - solr_config_data"
+    block: |
+      # Diese Variable wird automatisch in additional_config_data integriert
+      solr_config_data:
+      {% for line in moodle_solr_config %}
+        - "{{ line }}"
+      {% endfor %}
+    create: true
+  delegate_to: localhost
+  run_once: true
+
+# =============================================================================
+# MOODLE CONFIG.PHP INTEGRATION
+# =============================================================================
+- name: "[MOODLE] Update Moodle config.php via update-config-php role"
+  include_role:
+    name: update-config-php
+  when: moodle_path is defined
+
+# =============================================================================
+# MOODLE CONNECTIVITY TESTING
+# =============================================================================
+- name: "[MOODLE] Test Solr connectivity for Moodle"
+  uri:
+    url: "http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}/admin/ping"
+    method: GET
+    user: "{{ integration_solr_user if (solr_auth_enabled | default(false) | bool) else omit }}"
+    password: "{{ integration_solr_password if (solr_auth_enabled | default(false) | bool) else omit }}"
+    force_basic_auth: "{{ solr_auth_enabled | default(false) | bool }}"
+    timeout: 10
+  register: moodle_connectivity_test
+  ignore_errors: true
+
+# =============================================================================
+# MOODLE INTEGRATION SUMMARY
+# =============================================================================
+- name: "[MOODLE] Display integration summary"
+  debug:
+    msg:
+      - "================================================================"
+      - "✅ MOODLE-SOLR INTEGRATION COMPLETED"
+      - "================================================================"
+      - "Configuration:"
+      - "  - solr_port: {{ solr_port | default(8983) }}"
+      - "  - solr_core_name: {{ solr_core_name }}"
+      - "  - solr_auth_enabled: {{ solr_auth_enabled | default(false) }}"
+      - "  - integration_password: {{ '✅ Generated/Set' if integration_solr_password is defined else '❌ Missing' }}"
+      - "  - solr_config_data: ✅ Updated (sichere Variable)"
+      - "  - additional_config_data: ℹ️ Automatisch erweitert durch solr_config_data"
+      - "  - config.php: {{ '✅ Updated' if moodle_path is defined else 'ℹ️ Skipped (no moodle_path)' }}"
+      - "  - Connectivity: {{ '✅ OK' if moodle_connectivity_test.status is defined and moodle_connectivity_test.status == 200 else '⚠️ Check manually' }}"
+      - ""
+      - "🔒 Sicherheit: solr_config_data überschreibt keine bestehenden additional_config_data Einträge"
+      - "================================================================"

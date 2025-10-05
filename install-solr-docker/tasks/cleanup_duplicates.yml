@@ -1,0 +1,176 @@
+---
+# =============================================================================
+# ANSIBLE HOST_VARS AUTOMATIC DUPLICATE CLEANUP
+# Version: 3.1 - Smart Backup with Auto-Recovery
+# Maintainer: Bernd Schreistetter, Eledia GmbH
+# Description: Automatically detects/removes duplicates with rollback capability
+# =============================================================================
+
+- name: "[CLEANUP] 🔍 Preventive check for Solr-related duplicates or outdated data"
+  shell: |
+    HOST_VARS_FILE="{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    
+    if [ ! -f "$HOST_VARS_FILE" ]; then
+      echo "No issues found - host_vars file does not exist"
+      echo "CLEANUP_REQUIRED=false"
+      exit 0
+    fi
+    
+    # Count Solr-related keys
+    SOLR_PORT_COUNT=$(grep -c "^solr_port:" "$HOST_VARS_FILE" 2>/dev/null || echo "0")
+    SOLR_CORE_COUNT=$(grep -c "^solr_core_name:" "$HOST_VARS_FILE" 2>/dev/null || echo "0")
+    SOLR_CONTAINER_COUNT=$(grep -c "^solr_container_name:" "$HOST_VARS_FILE" 2>/dev/null || echo "0")
+    SOLR_AUTH_COUNT=$(grep -c "^solr_auth_enabled:" "$HOST_VARS_FILE" 2>/dev/null || echo "0")
+    SOLR_CONFIG_COUNT=$(grep -c "^solr_config_data:" "$HOST_VARS_FILE" 2>/dev/null || echo "0")
+    ADDITIONAL_CONFIG_COUNT=$(grep -c "^additional_config_data:" "$HOST_VARS_FILE" 2>/dev/null || echo "0")
+    
+    # Check for old Ansible-managed blocks
+    MANAGED_BLOCKS=$(grep -c "BEGIN ANSIBLE MANAGED" "$HOST_VARS_FILE" 2>/dev/null || echo "0")
+    
+    # Calculate total issues
+    TOTAL_DUPLICATES=0
+    if [ "$SOLR_PORT_COUNT" -gt 1 ]; then TOTAL_DUPLICATES=$((TOTAL_DUPLICATES + SOLR_PORT_COUNT - 1)); fi
+    if [ "$SOLR_CORE_COUNT" -gt 1 ]; then TOTAL_DUPLICATES=$((TOTAL_DUPLICATES + SOLR_CORE_COUNT - 1)); fi
+    if [ "$SOLR_CONTAINER_COUNT" -gt 1 ]; then TOTAL_DUPLICATES=$((TOTAL_DUPLICATES + SOLR_CONTAINER_COUNT - 1)); fi
+    if [ "$SOLR_AUTH_COUNT" -gt 1 ]; then TOTAL_DUPLICATES=$((TOTAL_DUPLICATES + SOLR_AUTH_COUNT - 1)); fi
+    if [ "$SOLR_CONFIG_COUNT" -gt 1 ]; then TOTAL_DUPLICATES=$((TOTAL_DUPLICATES + SOLR_CONFIG_COUNT - 1)); fi
+    if [ "$ADDITIONAL_CONFIG_COUNT" -gt 1 ]; then TOTAL_DUPLICATES=$((TOTAL_DUPLICATES + ADDITIONAL_CONFIG_COUNT - 1)); fi
+    
+    # Report findings and set flag for auto-cleanup
+    if [ "$TOTAL_DUPLICATES" -gt 0 ] || [ "$MANAGED_BLOCKS" -gt 0 ]; then
+      echo "⚠️  DUPLICATES DETECTED: $TOTAL_DUPLICATES duplicate entries, $MANAGED_BLOCKS old blocks"
+      echo "CLEANUP_REQUIRED=true"
+    else
+      echo "✅ No Solr-related duplicates or outdated data found"
+      echo "CLEANUP_REQUIRED=false"
+    fi
+  register: cleanup_check
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  failed_when: false
+  tags: [always, cleanup, validation]
+
+- name: "[CLEANUP] Set cleanup required flag"
+  set_fact:
+    hostvars_cleanup_required: "{{ 'CLEANUP_REQUIRED=true' in cleanup_check.stdout }}"
+  tags: [always, cleanup, validation]
+
+- name: "[CLEANUP] Create smart backup with timestamp for rollback capability"
+  copy:
+    src: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    dest: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}.solr_backup"
+    backup: no
+  delegate_to: localhost
+  when: hostvars_cleanup_required
+  register: backup_created
+  tags: [cleanup, validation]
+
+- name: "[CLEANUP] Store backup path for potential rollback"
+  set_fact:
+    solr_backup_file: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}.solr_backup"
+    solr_backup_created: "{{ backup_created.changed | default(false) }}"
+  when: hostvars_cleanup_required
+  tags: [cleanup, validation]
+
+- name: "[CLEANUP] Remove duplicate Solr configuration entries automatically"
+  shell: |
+    HOST_VARS_FILE="{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    TEMP_FILE="${HOST_VARS_FILE}.clean"
+    
+    # Create clean version without duplicates and old managed blocks
+    python3 << 'EOF'
+    import re
+    import sys
+    
+    input_file = "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+    output_file = input_file + ".clean"
+    
+    # Track which Solr config keys we've seen
+    seen_keys = set()
+    solr_keys = ['solr_port:', 'solr_core_name:', 'solr_container_name:', 'solr_auth_enabled:', 'solr_config_data:', 'additional_config_data:']
+    
+    # Track if we're in an old Ansible managed block
+    in_managed_block = False
+    in_solr_block = False
+    solr_block_indent = 0
+    
+    with open(input_file, 'r') as f:
+        lines = f.readlines()
+    
+    clean_lines = []
+    for i, line in enumerate(lines):
+        # Skip old Ansible managed blocks
+        if 'BEGIN ANSIBLE MANAGED' in line:
+            in_managed_block = True
+            continue
+        if 'END ANSIBLE MANAGED' in line:
+            in_managed_block = False
+            continue
+        if in_managed_block:
+            continue
+            
+        # Check for duplicate Solr keys
+        line_stripped = line.strip()
+        is_duplicate = False
+        
+        for key in solr_keys:
+            if line_stripped.startswith(key):
+                if key in seen_keys:
+                    is_duplicate = True
+                    print(f"Removing duplicate: {line_stripped[:50]}...")
+                    # If this is start of a multi-line block, skip until next key
+                    if key in ['solr_config_data:', 'additional_config_data:']:
+                        in_solr_block = True
+                        solr_block_indent = len(line) - len(line.lstrip())
+                    break
+                else:
+                    seen_keys.add(key)
+        
+        # Skip lines in duplicate multi-line blocks
+        if in_solr_block and is_duplicate:
+            current_indent = len(line) - len(line.lstrip())
+            # Continue skipping until we reach a line with same or less indentation
+            if current_indent > solr_block_indent or line_stripped.startswith(('  - ', '    ')):
+                continue
+            else:
+                in_solr_block = False
+        
+        if not is_duplicate:
+            clean_lines.append(line)
+    
+    # Write clean version
+    with open(output_file, 'w') as f:
+        f.writelines(clean_lines)
+    
+    print(f"✅ Cleaned host_vars file: removed duplicates and old blocks")
+    EOF
+    
+    # Replace original with cleaned version
+    if [ -f "${TEMP_FILE}" ]; then
+      mv "${TEMP_FILE}" "${HOST_VARS_FILE}"
+      echo "✅ Host_vars file automatically cleaned"
+    else
+      echo "❌ Cleanup failed - keeping original file"
+      exit 1
+    fi
+  register: cleanup_result
+  delegate_to: localhost
+  when: hostvars_cleanup_required
+  tags: [cleanup, validation]
+
+- name: "[CLEANUP] Display preventive cleanup results"
+  debug:
+    msg: "{{ hostvars_cleanup_required | ternary(['🔧 PREVENTIVE CLEANUP PERFORMED', '✅ Host_vars file cleaned of duplicates and old entries', '📄 Smart backup created for rollback capability', '🛡️  Installation can proceed safely'], ['✅ PREVENTIVE CHECK PASSED', '📋 No cleanup required - host_vars file is clean', '🚀 Ready for Solr installation']) }}"
+  tags: [always, cleanup, validation]
+
+# =============================================================================
+# SMART BACKUP MANAGEMENT WITH AUTO-RECOVERY
+# =============================================================================
+
+- name: "[CLEANUP] Register current deployment session for success tracking"
+  set_fact:
+    solr_deployment_session_id: "{{ ansible_date_time.epoch }}"
+    solr_cleanup_completed: true
+  when: hostvars_cleanup_required
+  tags: [cleanup, validation]

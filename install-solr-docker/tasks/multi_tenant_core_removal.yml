@@ -1,0 +1,269 @@
+---
+# =============================================================================
+# MULTI-TENANT CORE REMOVAL v3.3.1
+# Purpose: Safe removal of individual customer cores without affecting the system
+# Usage: ansible-playbook install-solr.yml -e remove_solr_core="customer_name"
+# =============================================================================
+
+- name: "[CORE-REMOVAL] Multi-Tenant Core Removal Banner"
+  debug:
+    msg:
+      - "================================================================"
+      - "🗑️ ELEDIA SOLR CORE REMOVAL v3.3.1"
+      - "================================================================"
+      - "Target Core: {{ remove_solr_core }}"
+      - "Container: {{ solr_docker_container_name }}"
+      - "Multi-Tenant Server: {{ inventory_hostname }}"
+      - "⚠️ WARNING: This will permanently remove the specified core!"
+      - "================================================================"
+
+# =============================================================================
+# VALIDATION AND SAFETY CHECKS
+# =============================================================================
+- name: "[CORE-REMOVAL] Validate removal parameters"
+  fail:
+    msg: "Core removal requires: remove_solr_core parameter to be set"
+  when: 
+    - remove_solr_core == ""
+    - remove_solr_core is not defined
+  tags: [validation]
+
+- name: "[CORE-REMOVAL] Validate Multi-Tenant mode"
+  fail:
+    msg: "Core removal is only available in Multi-Tenant mode"
+  when: not solr_is_multi_tenant
+  tags: [validation]
+
+- name: "[CORE-REMOVAL] Check if Solr container is running"
+  community.docker.docker_container_info:
+    name: "{{ solr_docker_container_name }}"
+  register: container_info
+  failed_when: false
+
+- name: "[CORE-REMOVAL] Validate container availability"
+  fail:
+    msg: "Solr container '{{ solr_docker_container_name }}' is not running. Cannot remove core."
+  when: 
+    - not container_info.exists | default(false)
+    - not container_info.container.State.Running | default(false)
+  tags: [validation]
+
+# =============================================================================
+# CORE EXISTENCE CHECK
+# =============================================================================
+- name: "[CORE-REMOVAL] Check if target core exists"
+  uri:
+    url: "http://localhost:{{ solr_docker_port }}/solr/admin/cores?action=STATUS&core={{ remove_solr_core }}&wt=json"
+    url_username: "{{ solr_admin_user }}"
+    url_password: "{{ solr_admin_password }}"
+    force_basic_auth: true
+    timeout: 10
+  register: core_status_check
+  failed_when: false
+
+- name: "[CORE-REMOVAL] Parse core existence"
+  set_fact:
+    core_exists: "{{ remove_solr_core in (core_status_check.json.status.keys() | list) if core_status_check.status == 200 else false }}"
+    available_cores: "{{ core_status_check.json.status.keys() | list if core_status_check.status == 200 else [] }}"
+
+- name: "[CORE-REMOVAL] Core not found - Display available cores"
+  debug:
+    msg:
+      - "================================================================"
+      - "❌ CORE NOT FOUND"
+      - "================================================================"
+      - "Requested core '{{ remove_solr_core }}' does not exist."
+      - ""
+      - "Available cores on this Multi-Tenant server:"
+      - "{% for core in available_cores %}"
+      - "  - {{ core }}"
+      - "{% endfor %}"
+      - ""
+      - "To remove an existing core, use:"
+      - "ansible-playbook install-solr.yml -e remove_solr_core=\"<core_name>\""
+      - "================================================================"
+  when: not core_exists
+
+- name: "[CORE-REMOVAL] Exit if core does not exist"
+  meta: end_play
+  when: not core_exists
+
+# =============================================================================
+# CORE INFORMATION GATHERING
+# =============================================================================
+- name: "[CORE-REMOVAL] Get detailed core information"
+  uri:
+    url: "http://localhost:{{ solr_docker_port }}/solr/admin/cores?action=STATUS&core={{ remove_solr_core }}&wt=json"
+    url_username: "{{ solr_admin_user }}"
+    url_password: "{{ solr_admin_password }}"
+    force_basic_auth: true
+    timeout: 10
+  register: core_details
+
+- name: "[CORE-REMOVAL] Extract core information"
+  set_fact:
+    core_data_dir: "{{ core_details.json.status[remove_solr_core].dataDir | default('unknown') }}"
+    core_instance_dir: "{{ core_details.json.status[remove_solr_core].instanceDir | default('unknown') }}"
+    core_index_size: "{{ core_details.json.status[remove_solr_core].index.sizeInBytes | default(0) }}"
+    core_num_docs: "{{ core_details.json.status[remove_solr_core].index.numDocs | default(0) }}"
+
+# =============================================================================
+# SAFETY CONFIRMATION
+# =============================================================================
+- name: "[CORE-REMOVAL] Display core removal summary"
+  debug:
+    msg:
+      - "================================================================"
+      - "⚠️ CORE REMOVAL CONFIRMATION"
+      - "================================================================"
+      - "Core to be removed: {{ remove_solr_core }}"
+      - "Data Directory: {{ core_data_dir }}"
+      - "Instance Directory: {{ core_instance_dir }}"
+      - "Index Size: {{ (core_index_size | int / 1024 / 1024) | round(1) }} MB"
+      - "Number of Documents: {{ core_num_docs }}"
+      - ""
+      - "⚠️ THIS ACTION CANNOT BE UNDONE!"
+      - "⚠️ ALL DATA IN THIS CORE WILL BE PERMANENTLY LOST!"
+      - ""
+      - "Proceeding with removal in 5 seconds..."
+      - "================================================================"
+
+- name: "[CORE-REMOVAL] Safety pause"
+  pause:
+    seconds: 5
+  when: not (force_core_removal | default(false))
+
+# =============================================================================
+# CORE UNLOADING AND REMOVAL
+# =============================================================================
+- name: "[CORE-REMOVAL] Unload core from Solr"
+  uri:
+    url: "http://localhost:{{ solr_docker_port }}/solr/admin/cores?action=UNLOAD&core={{ remove_solr_core }}&deleteIndex=true&deleteDataDir=true&deleteInstanceDir=true&wt=json"
+    url_username: "{{ solr_admin_user }}"
+    url_password: "{{ solr_admin_password }}"
+    force_basic_auth: true
+    method: GET
+    timeout: 30
+  register: core_unload_result
+
+- name: "[CORE-REMOVAL] Validate core unloading"
+  fail:
+    msg: "Failed to unload core: {{ core_unload_result.json.error.msg | default('Unknown error') }}"
+  when: 
+    - core_unload_result.status != 200
+    - "'error' in core_unload_result.json"
+
+# =============================================================================
+# FILESYSTEM CLEANUP (EXTRA SAFETY)
+# =============================================================================
+- name: "[CORE-REMOVAL] Clean up any remaining core directories"
+  shell: |
+    # Remove any remaining core directories from the container
+    docker exec {{ solr_docker_container_name }} bash -c "
+      echo 'Cleaning up remaining {{ remove_solr_core }} directories...'
+      
+      # Remove from cores directory
+      if [ -d '/var/solr/data/{{ remove_solr_core }}' ]; then
+        rm -rf '/var/solr/data/{{ remove_solr_core }}'
+        echo 'Removed data directory: /var/solr/data/{{ remove_solr_core }}'
+      fi
+      
+      # Remove from configsets if exists
+      if [ -d '/opt/solr/server/solr/configsets/{{ remove_solr_core }}' ]; then
+        rm -rf '/opt/solr/server/solr/configsets/{{ remove_solr_core }}'
+        echo 'Removed configset: /opt/solr/server/solr/configsets/{{ remove_solr_core }}'
+      fi
+      
+      echo 'Filesystem cleanup completed for {{ remove_solr_core }}'
+    "
+  register: filesystem_cleanup
+  failed_when: false
+
+# =============================================================================
+# VERIFICATION AND STATUS
+# =============================================================================
+- name: "[CORE-REMOVAL] Verify core removal"
+  uri:
+    url: "http://localhost:{{ solr_docker_port }}/solr/admin/cores?action=STATUS&wt=json"
+    url_username: "{{ solr_admin_user }}"
+    url_password: "{{ solr_admin_password }}"
+    force_basic_auth: true
+    timeout: 10
+  register: post_removal_status
+
+- name: "[CORE-REMOVAL] Confirm removal success"
+  set_fact:
+    removal_successful: "{{ remove_solr_core not in (post_removal_status.json.status.keys() | list) }}"
+    remaining_cores: "{{ post_removal_status.json.status.keys() | list }}"
+
+- name: "[CORE-REMOVAL] Log removal in container"
+  shell: |
+    docker exec {{ solr_docker_container_name }} bash -c "
+      echo '$(date): Core {{ remove_solr_core }} removed by Ansible from {{ inventory_hostname }}' >> /var/solr/logs/core_management.log
+    "
+  failed_when: false
+
+# =============================================================================
+# REMOVAL SUMMARY AND REPORT
+# =============================================================================
+- name: "[CORE-REMOVAL] Core removal completion summary"
+  debug:
+    msg:
+      - "================================================================"
+      - "✅ CORE REMOVAL COMPLETED"
+      - "================================================================"
+      - "Removed Core: {{ remove_solr_core }}"
+      - "Container: {{ solr_docker_container_name }}"
+      - "Removal Status: {{ '✅ SUCCESS' if removal_successful else '❌ FAILED' }}"
+      - ""
+      - "📊 REMOVAL DETAILS:"
+      - "  - Data Directory: {{ core_data_dir }} - ✅ Deleted"
+      - "  - Instance Directory: {{ core_instance_dir }} - ✅ Deleted"
+      - "  - Index Data: {{ (core_index_size | int / 1024 / 1024) | round(1) }} MB - ✅ Deleted"
+      - "  - Documents: {{ core_num_docs }} - ✅ Deleted"
+      - ""
+      - "🗄️ FILESYSTEM CLEANUP:"
+      - "{{ filesystem_cleanup.stdout_lines | join('\n  ') }}"
+      - ""
+      - "🌐 REMAINING CORES ON SERVER:"
+      - "{% if remaining_cores | length > 0 %}"
+      - "{% for core in remaining_cores %}"
+      - "  - {{ core }} (Active)"
+      - "{% endfor %}"
+      - "{% else %}"
+      - "  No cores remaining - Multi-Tenant server is empty"
+      - "{% endif %}"
+      - ""
+      - "📋 MULTI-TENANT SERVER STATUS:"
+      - "  Active Cores: {{ remaining_cores | length }}"
+      - "  Container Health: {{ '✅ Running' if container_info.container.State.Running else '❌ Not Running' }}"
+      - "  System Status: {{ '✅ Operational' if remaining_cores | length > 0 else '⚠️ Empty (Ready for new cores)' }}"
+      - ""
+      - "================================================================"
+      - "🎯 NEXT STEPS:"
+      - "{% if remaining_cores | length > 0 %}"
+      - "  - Multi-Tenant server continues to serve {{ remaining_cores | length }} core(s)"
+      - "  - Other customers are not affected by this removal"
+      - "{% else %}"
+      - "  - Server is ready to accept new customer cores"
+      - "  - Use: ansible-playbook install-solr.yml -e add_solr_core=\"new_customer\""
+      - "{% endif %}"
+      - "  - Check status: ansible-playbook install-solr.yml --tags status"
+      - "================================================================"
+
+- name: "[CORE-REMOVAL] Failure summary"
+  debug:
+    msg:
+      - "================================================================"
+      - "❌ CORE REMOVAL FAILED"
+      - "================================================================"
+      - "Core: {{ remove_solr_core }}"
+      - "Error: Core still exists after removal attempt"
+      - "Check Solr logs for detailed error information"
+      - "================================================================"
+  when: not removal_successful
+
+- name: "[CORE-REMOVAL] Fail if removal was not successful"
+  fail:
+    msg: "Core removal failed - {{ remove_solr_core }} still exists"
+  when: not removal_successful

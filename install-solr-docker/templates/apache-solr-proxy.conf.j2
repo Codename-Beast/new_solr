@@ -1,0 +1,72 @@
+# {{ ansible_managed }}
+# Apache Reverse Proxy Configuration for Solr Admin UI
+# Customer: {{ customer_name | default(moodle_app_domain.split('.')[0]) }}
+# Domain: {{ moodle_app_domain }}
+# Generated: {{ ansible_date_time.iso8601 }}
+
+<IfModule mod_proxy.c>
+    <IfModule mod_proxy_http.c>
+        
+        # Solr Admin UI Access Path
+        <Location /{{ solr_admin_path | default('__solr') }}>
+            ProxyPreserveHost Off
+            ProxyPass http://localhost:{{ solr_port | default(8983) }}/solr
+            ProxyPassReverse http://localhost:{{ solr_port | default(8983) }}/solr
+            
+            # Security Headers
+            RequestHeader set X-Forwarded-Proto "https"
+            RequestHeader set X-Forwarded-Port "443"
+            
+            # Authentication
+            <RequireAll>
+                Require ip 127.0.0.1
+                Require ip {{ ansible_default_ipv4.address }}
+                {% if solr_allowed_ips is defined %}
+                {% for ip in solr_allowed_ips %}
+                Require ip {{ ip }}
+                {% endfor %}
+                {% endif %}
+            </RequireAll>
+            
+            # Timeout Settings
+            ProxyTimeout 300
+            
+            # Logging
+            CustomLog ${APACHE_LOG_DIR}/{{ moodle_app_domain }}_solr_access.log combined
+            ErrorLog ${APACHE_LOG_DIR}/{{ moodle_app_domain }}_solr_error.log
+        </Location>
+        
+        #Direct API access (for Moodle)
+        {% if solr_enable_api_proxy | default(false) %}
+        <Location /{{ solr_api_path | default('__solr_api') }}>
+            ProxyPreserveHost Off
+            ProxyPass http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}
+            ProxyPassReverse http://localhost:{{ solr_port | default(8983) }}/solr/{{ solr_core_name }}
+            
+            RequestHeader set X-Forwarded-Proto "https"
+            RequestHeader set X-Forwarded-Port "443"
+            
+            # API Access - Moodle only
+            Require ip 127.0.0.1
+            
+            ProxyTimeout 300
+        </Location>
+        {% endif %}
+        
+    </IfModule>
+</IfModule>
+
+# Security: Prevent directory listing
+<LocationMatch "^/{{ solr_admin_path | default('__solr') }}">
+    Options -Indexes
+</LocationMatch>
+
+# Performance: Enable compression for Solr responses
+<IfModule mod_deflate.c>
+    <LocationMatch "^/{{ solr_admin_path | default('__solr') }}">
+        AddOutputFilterByType DEFLATE application/json
+        AddOutputFilterByType DEFLATE application/xml
+        AddOutputFilterByType DEFLATE text/html
+        AddOutputFilterByType DEFLATE text/plain
+    </LocationMatch>
+</IfModule>

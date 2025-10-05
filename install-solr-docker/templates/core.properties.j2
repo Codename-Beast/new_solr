@@ -1,0 +1,90 @@
+# =============================================================================
+# SOLR CORE PROPERTIES - MOODLE OPTIMIZED
+# Version: 6.0 - Moodle-specific core configuration for {{ customer_name }}
+# Generated: {{ ansible_date_time.iso8601 }}
+# =============================================================================
+
+# Core identification
+name={{ solr_core_name | default('eledia_solr_' + customer_name) }}
+configSet=_default
+
+# Instance configuration
+instanceDir={{ solr_core_name | default('eledia_solr_' + customer_name) }}
+dataDir=data
+
+# Schema configuration  
+config=solrconfig.xml
+schema=managed-schema
+
+# Moodle-specific search optimizations
+update.autoCreateFields=false
+update.commitWithin=15000
+query.defType=edismax
+query.qf=title^5 content^2 tags^3 description^1.5
+query.pf=title^10 content^5 tags^7
+query.pf2=title^15 content^8
+query.pf3=title^20 content^10
+query.mm=2<-1 5<-2 6<90%
+query.tie=0.1
+
+# Faceting and features
+facet=true
+facet.limit=50
+facet.mincount=1
+spellcheck=true
+spellcheck.accuracy=0.7
+highlight=true
+highlight.usePhraseHighlighter=true
+highlight.highlightMultiTerm=true
+
+# Performance settings optimized for Moodle
+ramBufferSizeMB=128
+maxBufferedDocs=1000
+mergeFactor=10
+useCompoundFile=false
+maxWarmingSearchers=4
+useColdSearcher=false
+maxIdleTime=30
+
+# Commit settings for Moodle content updates
+autoCommit.maxTime=15000
+autoCommit.maxDocs=1000
+autoSoftCommit.maxTime=1000
+autoSoftCommit.maxDocs=100
+
+# Moodle content type specific boosts
+boost.course_title=5.0
+boost.course_content=2.0
+boost.activity_title=4.0
+boost.activity_content=1.5
+boost.forum_post=1.2
+boost.wiki_content=1.8
+boost.resource_title=3.0
+boost.user_profile=0.8
+
+# Cache settings for Moodle search performance
+cache.size=1000
+cache.initialSize=100
+cache.autowarmCount=50
+
+# Security
+{% if solr_auth_enabled | default(false) %}
+security.json=/var/solr/data/security.json
+{% endif %}
+
+# Logging for Moodle integration debugging
+log.level=INFO
+log.file.maxSize=10MB
+log.file.maxFiles=5
+
+# Customer metadata
+customer.name={{ customer_name | default(moodle_app_domain.split('.')[0]) }}
+customer.domain={{ moodle_app_domain }}
+installation.date={{ ansible_date_time.epoch }}
+installation.version=6.0
+moodle.optimized=true
+moodle.version={{ moodle_version | default('unknown') }}
+
+# =============================================================================
+# END OF MOODLE-OPTIMIZED CORE PROPERTIES
+# =============================================================================

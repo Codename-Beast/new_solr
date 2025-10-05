@@ -1,0 +1,244 @@
+---
+# =============================================================================
+# SYSTEM PREPARATION v3.3.1 - Enhanced for Multi-Tenant Support
+# Combines facts, preflight, detection, validation for Docker-first approach
+# =============================================================================
+
+# =============================================================================
+# SYSTEM TYPE DETECTION AND CORE VARIABLES
+# =============================================================================
+- name: "[FACTS] Set role start time"
+  set_fact:
+    role_start_time: "{{ ansible_date_time.epoch }}"
+    cacheable: true
+
+- name: "[FACTS] Extract system types from hostvars"
+  set_fact:
+    detected_system_types: "{{ hostvars[inventory_hostname].system_type | default([]) }}"
+    detected_system_types_lower: "{{ (hostvars[inventory_hostname].system_type | default([])) | map('lower') | list }}"
+    cacheable: true
+
+- name: "[FACTS] Set deployment modes based on system type detection"
+  set_fact:
+    # Set deployment modes based on system type detection (case-insensitive)
+    # solr_server_mode parameter can override detected system type
+    solr_is_single_tenant: >-
+      {{ 
+        (solr_server_mode | default('') == 'single-tenant') or 
+        ('moodle' in detected_system_types_lower and solr_server_mode | default('') != 'multi-tenant') 
+      }}
+    solr_is_multi_tenant: >-
+      {{ 
+        (solr_server_mode | default('') == 'multi-tenant') or 
+        ('solr' in detected_system_types_lower and 'moodle' not in detected_system_types_lower and solr_server_mode | default('') != 'single-tenant') 
+      }}
+    cacheable: true
+
+- name: "[FACTS] Auto-detect moodle_app_domain from hostname for Single-Tenant"
+  set_fact:
+    moodle_app_domain: "{{ inventory_hostname.replace('xen-23-v_', '').replace('de', '.de') }}"
+    cacheable: true
+  when: 
+    - "'moodle' in detected_system_types_lower"
+    - moodle_app_domain is not defined or moodle_app_domain == ''
+
+- name: "[FACTS] Single-Tenant customer name extraction"
+  set_fact:
+    customer_name: "{{ moodle_app_domain.split('.')[0] if moodle_app_domain is defined else 'default' }}"
+    cacheable: true
+  when: "'moodle' in detected_system_types_lower"
+
+- name: "[FACTS] Multi-Tenant customer name handling"
+  set_fact:
+    customer_name: "{{ add_solr_core if add_solr_core != '' else 'multi_tenant_server' }}"
+    cacheable: true
+  when: "'solr' in detected_system_types_lower and 'moodle' not in detected_system_types_lower"
+
+# =============================================================================
+# v3.3.1 DOCKER-FIRST CONFIGURATION
+# =============================================================================
+- name: "[FACTS] Set v3.3.1 Docker configuration"
+  set_fact:
+    # Core naming with v3.3.1 prefix for Docker containers
+    solr_core_name: "{{ solr_core_name | default('eledia_solr_' + customer_name) }}"
+    # Einheitliche Container-Namen (beide Variablen für Kompatibilität)
+    solr_container_name: "{{ 'eledia-solr-' + (customer_name if solr_is_single_tenant else 'multi-tenant') }}"
+    solr_docker_container_name: "{{ 'eledia-solr-' + (customer_name if solr_is_single_tenant else 'multi-tenant') }}"
+    solr_data_dir: "/opt/eledia-solr-data/{{ customer_name if solr_is_single_tenant else 'multi_tenant_server' }}"
+    
+    # Docker v3.3.1 specific configuration - EINHEITLICHE VARIABLEN
+    solr_docker_image_name: "eledia-solr"
+    solr_docker_tag: "v3.3.1"
+    solr_docker_image_tag: "eledia-solr:v3.3.1"  # Für Kompatibilität mit alten Tasks
+    solr_docker_port: 8983
+    solr_docker_memory: "2g"
+    
+    # Production-ready authentication (always enabled in v3.3.1)
+    solr_admin_user: "{{ vault_solr_admin_user | default('admin') }}"
+    solr_admin_password: "{{ vault_solr_admin_password | default('changeme_secure_password') }}"
+    final_admin_user: "{{ vault_solr_admin_user | default('admin') }}"
+    
+    # SSL configuration
+    ssl_enabled: "{{ ssl_enabled | default(true) }}"
+    solr_auth_enabled: true  # Always enabled in v3.3.1
+    
+    # Detection variables - einheitlich für beide Modi
+    detection_data_dir: "/opt/eledia-solr-data/{{ customer_name if solr_is_single_tenant else 'multi_tenant_server' }}"
+    detection_container_name: "{{ 'eledia-solr-' + (customer_name if solr_is_single_tenant else 'multi-tenant') }}"
+    cacheable: true
+
+# =============================================================================
+# SSL CERTIFICATE DETECTION (Single-Tenant Only)
+# =============================================================================
+- name: "[SSL] Check for Let's Encrypt certificates"
+  stat:
+    path: "/etc/letsencrypt/live/{{ moodle_app_domain }}"
+  register: letsencrypt_cert
+  when: solr_is_single_tenant
+
+- name: "[SSL] Set SSL certificate availability"
+  set_fact:
+    ssl_certificate_available: "{{ letsencrypt_cert.stat.exists | default(false) }}"
+    cacheable: true
+
+# =============================================================================
+# PRE-FLIGHT VALIDATION v3.3.1
+# =============================================================================
+- name: "[PREFLIGHT] Check system requirements for v3.3.1"
+  assert:
+    that:
+      - ansible_distribution == 'Debian'
+      - ansible_architecture == 'x86_64'
+      - solr_is_single_tenant or solr_is_multi_tenant  # Must be one or the other
+    fail_msg: "System requirements not met for v3.3.1 deployment. Current system_type: {{ detected_system_types }}, Single-Tenant: {{ solr_is_single_tenant }}, Multi-Tenant: {{ solr_is_multi_tenant }}"
+    quiet: true
+
+- name: "[PREFLIGHT] Validate single-tenant requirements"
+  assert:
+    that:
+      - moodle_app_domain is defined
+      - moodle_app_domain | length > 0
+    fail_msg: "Single-tenant mode requires valid moodle_app_domain"
+    quiet: true
+  when: solr_is_single_tenant
+
+- name: "[PREFLIGHT] Validate multi-tenant requirements"
+  assert:
+    that:
+      - solr_docker_container_name is defined
+      - solr_docker_container_name | length > 0
+    fail_msg: "Multi-tenant mode requires valid solr_docker_container_name"
+    quiet: true
+  when: solr_is_multi_tenant
+
+- name: "[PREFLIGHT] Check available disk space"
+  shell: df /opt --output=avail | tail -1
+  register: disk_space_check
+  changed_when: false
+
+- name: "[PREFLIGHT] Validate disk space (minimum 2GB)"
+  assert:
+    that:
+      - disk_space_check.stdout | int > 2000000
+    fail_msg: "Insufficient disk space. Required: 2GB, Available: {{ (disk_space_check.stdout | int / 1024 / 1024) | round(1) }}GB"
+    quiet: true
+
+# =============================================================================
+# v3.3.1 DOCKER INSTALLATION DETECTION  
+# =============================================================================
+- name: "[DETECT] Check for existing Solr data directory"
+  stat:
+    path: "{{ detection_data_dir }}"
+  register: existing_solr_data
+
+- name: "[DETECT] Check for existing Docker container (v3.3.1)"
+  community.docker.docker_container_info:
+    name: "{{ detection_container_name }}"
+  register: existing_container_info
+  failed_when: false
+
+- name: "[DETECT] Set v3.3.1 installation detection facts"
+  set_fact:
+    solr_already_installed: "{{ existing_solr_data.stat.exists }}"
+    container_exists: "{{ existing_container_info.exists | default(false) }}"
+    container_running: "{{ existing_container_info.container.State.Running | default(false) }}"
+    # Enhanced skip logic for v3.3.1: skip only if container is running AND healthy
+    skip_solr_installation: >-
+      {{
+        existing_container_info.exists | default(false) and 
+        existing_container_info.container.State.Running | default(false) and
+        existing_solr_data.stat.exists 
+      }}
+    # Debugging information
+    container_state: "{{ existing_container_info.container.State.Status | default('not_found') }}"
+    container_health: "{{ existing_container_info.container.State.Health.Status | default('unknown') }}"
+    cacheable: true
+
+# =============================================================================
+# MOODLE VALIDATION (Single-Tenant Only)
+# =============================================================================
+- name: "[MOODLE] Check Moodle directory structure"
+  stat:
+    path: "{{ item }}"
+  register: moodle_structure_check
+  loop:
+    - "{{ moodle_path }}"
+    - "{{ moodle_path }}/config.php"
+    - "{{ moodle_path }}/version.php"
+  when: 
+    - solr_is_single_tenant
+    - moodle_path is defined
+
+- name: "[MOODLE] Validate Moodle installation"
+  assert:
+    that:
+      - item.stat.exists
+    fail_msg: "Moodle installation invalid: {{ item.item }} not found"
+    quiet: true
+  loop: "{{ moodle_structure_check.results }}"
+  when: 
+    - solr_is_single_tenant
+    - moodle_path is defined
+    - moodle_structure_check is defined
+
+- name: "[MOODLE] Extract Moodle version"
+  shell: grep "^\\$release\\s*=" {{ moodle_path }}/version.php | head -1 | sed "s/.*'\\([^']*\\)'.*/\\1/" || echo "unknown"
+  register: moodle_version_raw
+  changed_when: false
+  when: 
+    - solr_is_single_tenant
+    - moodle_path is defined
+
+- name: "[MOODLE] Set Moodle facts"
+  set_fact:
+    moodle_version: "{{ moodle_version_raw.stdout | default('unknown') }}"
+    moodle_validated: true
+    cacheable: true
+  when: 
+    - solr_is_single_tenant
+    - moodle_path is defined
+
+# =============================================================================
+# v3.3.1 PREPARATION SUMMARY
+# =============================================================================
+- name: "[SUMMARY] Display v3.3.1 preparation results"
+  debug:
+    msg:
+      - "================================================================"
+      - "SYSTEM PREPARATION v3.3.1 COMPLETED"
+      - "================================================================"
+      - "Deployment Mode: {{ 'Single-Tenant (Moodle)' if solr_is_single_tenant else 'Multi-Tenant (Solr Server)' }}"
+      - "Customer: {{ customer_name }}"
+      - "System Types: {{ detected_system_types }}"
+      - "Docker Image: {{ solr_docker_image_tag }}"
+      - "Container: {{ solr_container_name }}"
+      - "Port: {{ solr_docker_port }}"
+      - "Memory: {{ solr_docker_memory }}"
+      - "Data Directory: {{ solr_data_dir }}"
+      - "Authentication: ENABLED (Production-Ready)"
+      - "Container Status: {{ container_state }}"
+      - "Container Health: {{ container_health }}"
+      - "Skip Installation: {{ 'Yes' if skip_solr_installation else 'No' }}"
+      - "Moodle Version: {{ moodle_version | default('N/A - Multi-Tenant Mode') }}"
+      - "SSL Certificate: {{ 'Available' if ssl_certificate_available | default(false) else 'Not Available' }}"
+      - "================================================================"

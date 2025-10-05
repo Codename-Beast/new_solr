@@ -1,0 +1,311 @@
+# =============================================================================
+# Eledia Solr v3.3.1 Complete Uninstall (Multi-System Support)
+# =============================================================================
+# Supports both Single-Tenant (eledia-solr-CUSTOMER) and Multi-Tenant (eledia-solr-multi-tenant) systems
+# Comprehensive removal of all Solr-related components, containers, and residuals
+# =============================================================================
+
+- name: "[UNINSTALL] Setup v3.3.1 uninstall variables for both system types"
+  set_fact:
+    # Version and basic settings
+    solr_version: "{{ VERSION | default('v3.3.1') }}"
+    keep_docker_volumes: "{{ KEEP_DOCKER_VOLUMES | default(false) | bool }}"
+    
+    # Customer and domain identification
+    customer_name: "{{ CUSTOMER | default('multi_tenant_server') }}"
+    domain_name: "{{ DOMAIN | default('Multi-Tenant Server') }}"
+    
+    # Container naming patterns for detection
+    single_tenant_container_pattern: "eledia-solr-{{ CUSTOMER | default('test') }}"
+    multi_tenant_container_pattern: "eledia-solr-multi-tenant"
+    
+    # Path patterns for cleanup
+    opt_paths_to_remove:
+      - "/opt/eledia-solr*"
+      - "/opt/solr*"
+      - "/opt/solr-venv"
+      - "/opt/containerd"
+    
+    var_lib_paths_to_remove:
+      - "/var/lib/eledia-solr*"
+    
+    cacheable: true
+
+- name: "[UNINSTALL] Check for Solr containers (v3.3.1) - All system types"
+  shell: |
+    docker ps -a --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "eledia-solr-.*" || true
+  register: container_detection_result
+  changed_when: false
+  failed_when: false
+
+- name: "[UNINSTALL] Set container detection facts"
+  set_fact:
+    found_containers_raw: "{{ container_detection_result.stdout_lines | default([]) }}"
+    found_containers_list: "{{ container_detection_result.stdout_lines | default([]) | reject('==', '') | list }}"
+    cacheable: true
+
+- name: "[UNINSTALL] No Solr Installation detected - Exit (v3.3.1)"
+  debug:
+    msg:
+      - "================================================================"
+      - "ℹ️ NO SOLR INSTALLATION DETECTED"
+      - "================================================================"
+      - "✅ System appears to be clean - no Solr containers found"
+      - "Container patterns checked:"
+      - "  - eledia-solr-* (All patterns)"
+      - "================================================================"
+  when: found_containers_list | length == 0
+
+- name: "[UNINSTALL] Exit if no Solr installation found (v3.3.1)"
+  meta: end_play
+  when: found_containers_list | length == 0
+
+- name: "[UNINSTALL] Display v3.3.1 uninstall banner (Multi-System Support)"
+  debug:
+    msg:
+      - "================================================================"
+      - "🗑️ ELEDIA SOLR UNINSTALL v3.3.1 (MULTI-SYSTEM)"
+      - "================================================================"
+      - "⚠️ WARNING: This will completely remove Solr installation"
+      - "Mode: {{ 'Multi-Tenant (Solr Server)' if (found_containers_list | select('match', '.*multi-tenant.*') | list | length > 0) else 'Single-Tenant (Moodle)' }}"
+      - "Customer: {{ customer_name }}"
+      - "Primary Container: {{ found_containers_list[0] }}"
+      - "Found Containers: {{ found_containers_list | length }}"
+      - "Domain: {{ domain_name }}"
+      - "================================================================"
+      - "✅ Solr installation detected:"
+      - ""
+      - "Container List: {{ found_containers_list | join(', ') }}"
+      - "================================================================"
+  when: found_containers_list | length > 0
+
+# Stop and remove containers
+- name: "[UNINSTALL] Stop and remove all found Solr containers (v3.3.1)"
+  shell: |
+    for container in {{ found_containers_list | join(' ') }}; do
+      echo "Stopping container: $container"
+      docker stop "$container" 2>/dev/null || true
+      echo "Removing container: $container"
+      docker rm "$container" 2>/dev/null || true
+      echo "STOPPED:  $container"
+      echo "REMOVED:  $container"
+    done
+  when: found_containers_list | length > 0
+
+# Docker volume cleanup
+- name: "[UNINSTALL] List Docker volumes before cleanup (v3.3.1) - All systems"
+  shell: |
+    echo "Volumes before cleanup:"
+    docker volume ls --format "{{ '{{' }}.Name{{ '}}' }}" | grep -E "(eledia-solr|solr)" || echo "No matching volumes found"
+    docker volume ls --format "{{ '{{' }}.Name{{ '}}' }}" | grep -E "(eledia-solr|solr)" || true
+  register: volumes_before_cleanup
+  changed_when: false
+
+- name: "[UNINSTALL] Remove Docker volumes v3.3.1 - All containers (CRITICAL DATA LOSS WARNING)"
+  shell: |
+    docker volume ls --format "{{ '{{' }}.Name{{ '}}' }}" | grep -E "(eledia-solr|solr)" | while read volume; do
+      docker volume rm "$volume" 2>/dev/null || true
+    done
+    echo "Removed volumes: $(docker volume ls --format '{{ '{{' }}.Name{{ '}}' }}' | grep -E '(eledia-solr|solr)' | xargs || echo 'none')"
+  when: not keep_docker_volumes
+
+- name: "[UNINSTALL] Verify Docker volume cleanup - All systems"
+  shell: |
+    echo "Volumes after cleanup:"
+    remaining_volumes=$(docker volume ls --format "{{ '{{' }}.Name{{ '}}' }}" | grep -E "(eledia-solr|solr)" || true)
+    if [ -z "$remaining_volumes" ]; then
+      echo "All eledia-solr-multi-tenant volumes removed"
+      echo "All eledia-solr volumes removed"
+    else
+      echo "Remaining volumes: $remaining_volumes"
+    fi
+  register: volumes_after_cleanup
+  changed_when: false
+
+# Directory cleanup
+- name: "[UNINSTALL] Remove all Solr-related directories in /opt"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/opt/eledia-solr"
+    - "/opt/eledia-solr-{{ customer_name }}"
+    - "/opt/eledia-solr-multi-tenant"
+    - "/opt/solr"
+    - "/opt/solr-{{ customer_name }}"
+    - "/opt/solr-venv"
+    - "/opt/containerd"
+  ignore_errors: true
+
+- name: "[UNINSTALL] Remove all Solr installation metadata and state"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/var/lib/eledia-solr"
+    - "/var/lib/eledia-solr-{{ customer_name }}"
+    - "/var/lib/eledia-solr-multi-tenant"
+  ignore_errors: true
+
+- name: "[UNINSTALL] Remove specific customer data directory"
+  file:
+    path: "/var/lib/eledia-solr-{{ customer_name }}"
+    state: absent
+  ignore_errors: true
+
+# System service cleanup
+- name: "[UNINSTALL] Stop and disable any Solr systemd services"
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - "solr"
+    - "eledia-solr"
+    - "eledia-solr-{{ customer_name }}"
+  ignore_errors: true
+
+- name: "[UNINSTALL] Remove Solr systemd service files"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/etc/systemd/system/solr.service"
+    - "/etc/systemd/system/eledia-solr.service"
+    - "/etc/systemd/system/eledia-solr-{{ customer_name }}.service"
+  ignore_errors: true
+
+# Configuration cleanup
+- name: "[UNINSTALL] Remove Solr configuration files"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/etc/default/solr"
+    - "/etc/solr"
+    - "/usr/local/bin/solr"
+  ignore_errors: true
+
+# Log cleanup
+- name: "[UNINSTALL] Remove Solr log files"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/var/log/solr"
+    - "/var/log/eledia-solr"
+    - "/var/log/eledia-solr-{{ customer_name }}"
+  ignore_errors: true
+
+# User cleanup
+- name: "[UNINSTALL] Remove Solr user account"
+  user:
+    name: solr
+    state: absent
+    remove: true
+  ignore_errors: true
+
+- name: "[UNINSTALL] Remove Solr group"
+  group:
+    name: solr
+    state: absent
+  ignore_errors: true
+
+# Docker cleanup
+- name: "[UNINSTALL] Stop and remove ALL Solr-related containers"
+  shell: |
+    # Remove all Solr containers (any that might be missed)
+    docker ps -a --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "(solr|eledia)" | while read container; do
+      docker stop "$container" 2>/dev/null || true
+      docker rm "$container" 2>/dev/null || true
+    done
+    
+    # Remove Solr Docker images
+    docker images --format "{{ '{{' }}.Repository{{ '}}' }}:{{ '{{' }}.Tag{{ '}}' }}" | grep -E "(solr|eledia)" | while read image; do
+      docker rmi "$image" 2>/dev/null || true
+    done
+    
+    echo "Docker Solr cleanup completed"
+  ignore_errors: true
+
+- name: "[UNINSTALL] Remove ALL Solr-related Docker volumes"
+  shell: |
+    docker volume ls --format "{{ '{{' }}.Name{{ '}}' }}" | grep -E "(solr|eledia)" | while read volume; do
+      docker volume rm "$volume" 2>/dev/null || true
+    done
+    echo "All Solr Docker volumes removed"
+  ignore_errors: true
+
+# Miscellaneous cleanup
+- name: "[UNINSTALL] Remove Solr-related cron jobs"
+  cron:
+    name: "{{ item }}"
+    state: absent
+  loop:
+    - "Solr backup"
+    - "Solr maintenance"
+    - "Eledia Solr backup"
+    - "Eledia Solr maintenance"
+  ignore_errors: true
+
+- name: "[UNINSTALL] Remove Solr temporary files"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/solr*"
+    - "/tmp/eledia-solr*"
+    - "/var/tmp/solr*"
+  ignore_errors: true
+
+- name: "[UNINSTALL] Reload systemd daemon"
+  systemd:
+    daemon_reload: true
+
+# Final verification
+- name: "[UNINSTALL] Verify container removal (v3.3.1) - All systems"
+  shell: |
+    remaining_containers=$(docker ps -a --format "{{ '{{' }}.Names{{ '}}' }}" | grep -E "eledia-solr" || true)
+    if [ -z "$remaining_containers" ]; then
+      echo "SUCCESS - All containers removed"
+    else
+      echo "WARNING - Remaining containers: $remaining_containers"
+    fi
+  register: container_removal_verification
+  changed_when: false
+
+- name: "[UNINSTALL] Confirm container removal status (v3.3.1)"
+  debug:
+    msg: "Container removal status: {{ container_removal_verification.stdout }}"
+
+# Final summary
+- name: "[UNINSTALL] Display comprehensive uninstall summary (Multi-System Support)"
+  debug:
+    msg:
+      - "================================================================"
+      - "🎉 ELEDIA SOLR v3.3.1 UNINSTALL COMPLETED SUCCESSFULLY"
+      - "================================================================"
+      - "📋 System Type: {{ 'Multi-Tenant (Solr Server)' if (found_containers_list | select('match', '.*multi-tenant.*') | list | length > 0) else 'Single-Tenant' }}"
+      - "📦 Customer: {{ customer_name }}"
+      - "🏷️ Domain: {{ domain_name }}"
+      - ""
+      - "🗑️ CONTAINERS REMOVED:"
+      - "{{ found_containers_list | map('regex_replace', '^(.*)$', '  - \\1 ❌ Removed') | join('\n') }}"
+      - ""
+      - "🗂️ DIRECTORIES CLEANED:"
+      - "  - /opt/eledia-solr* directories"
+      - "  - /opt/solr* directories"
+      - "  - /var/lib/eledia-solr* directories"
+      - ""
+      - "🐳 DOCKER RESOURCES:"
+      - "  - All containers stopped and removed"
+      - "  - All volumes {{ 'preserved' if keep_docker_volumes else 'deleted' }}"
+      - "  - Docker images cleaned"
+      - ""
+      - "⚙️ SYSTEM SERVICES:"
+      - "  - All systemd services stopped and removed"
+      - "  - Configuration files cleaned"
+      - "  - User accounts removed"
+      - ""
+      - "⚠️ Note: This system is now completely clean of Solr installations"
+      - "================================================================"

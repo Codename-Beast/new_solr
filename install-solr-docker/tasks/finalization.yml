@@ -1,0 +1,836 @@
+---
+# =============================================================================
+# FINALIZATION
+# =============================================================================
+
+# =============================================================================
+# VARIABLE COMPATIBILITY - Support for both single-tenant and multi-tenant setups
+# =============================================================================
+- name: "Set app_domain variable (Multi-Tenant and Single-Tenant compatibility)"
+  set_fact:
+    app_domain: "{{ solr_app_domain | default(moodle_app_domain | default('unknown-domain')) }}"
+
+# =============================================================================
+# DOCKER COMPOSE GENERATION (DOCKERFILE-BASED DEPLOYMENT)
+# only if dockerfile_path is defined
+# =============================================================================
+- name: "[COMPOSE] Create docker-compose directory"
+  file:
+    path: "/opt/eledia-solr-management/{{ customer_name }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0755'
+  become: true
+  when: 
+    - dockerfile_path is defined
+    - dockerfile_path != ""
+
+- name: "[COMPOSE] Copy custom Dockerfile to build directory"
+  copy:
+    src: "{{ dockerfile_path }}"
+    dest: "/opt/eledia-solr-management/{{ customer_name }}/Dockerfile"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0644'
+  become: true
+  when: 
+    - dockerfile_path is defined
+    - dockerfile_path != ""
+
+- name: "[COMPOSE] Generate docker-compose.yml for Dockerfile-based deployment"
+  copy:
+    content: |
+      version: '3.8'
+      
+      # Eledia Solr Docker Compose - Dockerfile-based Deployment
+      # Generated: {{ ansible_date_time.iso8601 }}
+      # Customer: {{ customer_name }}
+      # Domain: {{ app_domain }}
+      # Mode: Custom Dockerfile Build
+      
+      services:
+        {{ solr_container_name }}:
+          build:
+            context: .
+            dockerfile: Dockerfile
+            args:
+              SOLR_VERSION: "{{ solr_version | default('9.9.0') }}"
+              SOLR_HEAP: "{{ solr_heap_size | default('512m') }}"
+              CUSTOMER_NAME: "{{ customer_name }}"
+              CORE_NAME: "{{ solr_core_name }}"
+          container_name: {{ solr_container_name }}
+          restart: unless-stopped
+          ports:
+            - "127.0.0.1:{{ solr_port | default(8983) }}:8983"
+          volumes:
+            - {{ solr_data_dir }}:/var/solr/data
+            - ./config:/opt/solr/server/solr/configsets/custom:ro
+          environment:
+            SOLR_HEAP: {{ solr_heap_size | default('512m') }}
+            SOLR_JAVA_MEM: {{ solr_java_mem | default('-Xms512m -Xmx512m') }}
+            SOLR_OPTS: {{ solr_opts | default('-Dsolr.autoSoftCommit.maxTime=3000') }}
+            SOLR_CORE_NAME: {{ solr_core_name }}
+            SOLR_AUTH_ENABLED: {{ solr_auth_enabled | default(false) | lower }}
+            {% if solr_auth_enabled | default(false) | bool %}
+            SOLR_ADMIN_USER: {{ solr_auth_admin_user | default('admin') }}
+            SOLR_ADMIN_PASSWORD: {{ solr_auth_admin_password }}
+            SOLR_SUPPORT_USER: {{ solr_auth_support_user | default('support') }}
+            SOLR_SUPPORT_PASSWORD: {{ solr_auth_support_password }}
+            {% endif %}
+          user: "8983:8983"
+          healthcheck:
+            test: ["CMD-SHELL", "curl -f http://localhost:8983/solr/admin/ping || exit 1"]
+            interval: 30s
+            timeout: 10s
+            retries: 5
+            start_period: 60s
+          labels:
+            - "eledia.service=solr"
+            - "eledia.customer={{ customer_name }}"
+            - "eledia.domain={{ app_domain }}"
+            - "eledia.core={{ solr_core_name }}"
+            - "eledia.deployment=dockerfile"
+      
+      volumes:
+        solr_data:
+          driver: local
+          driver_opts:
+            type: none
+            o: bind
+            device: {{ solr_data_dir }}
+      
+      networks:
+        default:
+          name: eledia-solr-{{ customer_name }}
+    dest: "/opt/eledia-solr-management/{{ customer_name }}/docker-compose.yml"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0644'
+  become: true
+  when: 
+    - dockerfile_path is defined
+    - dockerfile_path != ""
+
+- name: "[COMPOSE] Copy Solr configuration files for Dockerfile build"
+  copy:
+    src: "{{ item }}"
+    dest: "/opt/eledia-solr-management/{{ customer_name }}/config/"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0644'
+  become: true
+  with_fileglob:
+    - "{{ role_path }}/files/conf/*"
+  when: 
+    - dockerfile_path is defined
+    - dockerfile_path != ""
+
+- name: "[COMPOSE] Create management scripts for Dockerfile deployment"
+  copy:
+    content: |
+      #!/bin/bash
+      # Eledia Solr Management Script - {{ customer_name }}
+      # Mode: Dockerfile-based Deployment
+      
+      COMPOSE_DIR="/opt/eledia-solr-management/{{ customer_name }}"
+      CONTAINER_NAME="{{ solr_container_name }}"
+      
+      case "$1" in
+        build)
+          echo "Building custom Solr image..."
+          cd "$COMPOSE_DIR" && docker-compose build --no-cache
+          ;;
+        start)
+          echo "Starting Solr services..."
+          cd "$COMPOSE_DIR" && docker-compose up -d
+          ;;
+        stop)
+          echo "Stopping Solr services..."
+          cd "$COMPOSE_DIR" && docker-compose down
+          ;;
+        restart)
+          echo "Restarting Solr services..."
+          cd "$COMPOSE_DIR" && docker-compose restart
+          ;;
+        rebuild)
+          echo "Rebuilding and restarting..."
+          cd "$COMPOSE_DIR" && docker-compose down
+          cd "$COMPOSE_DIR" && docker-compose build --no-cache
+          cd "$COMPOSE_DIR" && docker-compose up -d
+          ;;
+        logs)
+          cd "$COMPOSE_DIR" && docker-compose logs -f
+          ;;
+        status)
+          cd "$COMPOSE_DIR" && docker-compose ps
+          echo ""
+          echo "Container details:"
+          docker inspect "$CONTAINER_NAME" --format='Container: {{.Name}} | Status: {{.State.Status}} | Health: {{.State.Health.Status}}' 2>/dev/null || echo "Container not found"
+          ;;
+        shell)
+          echo "Accessing container shell..."
+          docker exec -it "$CONTAINER_NAME" bash
+          ;;
+        backup)
+          BACKUP_FILE="{{ solr_data_dir }}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+          echo "Creating backup: $BACKUP_FILE"
+          tar -czf "$BACKUP_FILE" {{ solr_data_dir }}
+          echo "Backup completed: $BACKUP_FILE"
+          ;;
+        update)
+          echo "Updating deployment..."
+          cd "$COMPOSE_DIR" && docker-compose pull
+          cd "$COMPOSE_DIR" && docker-compose up -d
+          ;;
+        *)
+          echo "Eledia Solr Management - Dockerfile Mode"
+          echo ""
+          echo "Usage: $0 {build|start|stop|restart|rebuild|logs|status|shell|backup|update}"
+          echo ""
+          echo "Commands:"
+          echo "  build    - Build custom Solr image from Dockerfile"
+          echo "  start    - Start Solr services"
+          echo "  stop     - Stop Solr services"
+          echo "  restart  - Restart Solr services"
+          echo "  rebuild  - Rebuild image and restart"
+          echo "  logs     - Follow container logs"
+          echo "  status   - Show container status"
+          echo "  shell    - Access container shell"
+          echo "  backup   - Create data backup"
+          echo "  update   - Update and restart services"
+          exit 1
+          ;;
+      esac
+    dest: "/opt/eledia-solr-management/{{ customer_name }}/manage-solr.sh"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0755'
+  become: true
+  when: 
+    - dockerfile_path is defined
+    - dockerfile_path != ""
+
+- name: "[COMPOSE] Display Dockerfile deployment information"
+  debug:
+    msg:
+      - "================================================================"
+      - "🐳 DOCKERFILE-BASED DEPLOYMENT ACTIVATED"
+      - "================================================================"
+      - ""
+      - "📁 DEPLOYMENT FILES:"
+      - "  Directory: /opt/eledia-solr-management/{{ customer_name }}/"
+      - "  Dockerfile: /opt/eledia-solr-management/{{ customer_name }}/Dockerfile"
+      - "  Docker-Compose: /opt/eledia-solr-management/{{ customer_name }}/docker-compose.yml"
+      - "  Management Script: /opt/eledia-solr-management/{{ customer_name }}/manage-solr.sh"
+      - ""
+      - "🔧 DEPLOYMENT COMMANDS:"
+      - "  Build Image: cd /opt/eledia-solr-management/{{ customer_name }} && ./manage-solr.sh build"
+      - "  Start Service: cd /opt/eledia-solr-management/{{ customer_name }} && ./manage-solr.sh start"
+      - "  Check Status: cd /opt/eledia-solr-management/{{ customer_name }} && ./manage-solr.sh status"
+      - "  View Logs: cd /opt/eledia-solr-management/{{ customer_name }} && ./manage-solr.sh logs"
+      - ""
+      - "⚠️  IMPORTANT:"
+      - "  - Ansible hat Container NICHT gestartet (Dockerfile-Modus)"
+      - "  - Führe './manage-solr.sh build' und dann './manage-solr.sh start' aus"
+      - "  - Container wird mit deiner Custom-Dockerfile erstellt"
+      - ""
+      - "================================================================"
+  when: 
+    - dockerfile_path is defined
+    - dockerfile_path != ""
+
+- name: "[Docker] Displayd deployment information"
+  debug:
+    msg:
+      - "================================================================"
+      - "⚡ANSIBLE DEPLOYMENT"
+      - "================================================================"
+      - ""
+      - "🎯 DEPLOYMENT MODE:"
+      - "  Mode: Direct Ansible Container Management"
+      - "  Container: {{ solr_container_name }}"
+      - "  Status: Running (managed by Ansible)"
+      - ""
+      - "💡 INFO:"
+      - "  - Kein Docker-Compose erstellt / Übergeben"
+      - "  - Container direkt von Ansible verwaltet"
+      - "  - Keine benutzerdefinierte Dockerfile verwendet"
+      - ""
+      - "🔧 MANAGEMENT:"
+      - "  - Container-Status: docker ps | grep {{ solr_container_name }}"
+      - "  - Logs anzeigen: docker logs {{ solr_container_name }}"
+      - "  - Container neustarten: docker restart {{ solr_container_name }}"
+      - ""
+      - "================================================================"
+  when: 
+    - dockerfile_path is not defined or dockerfile_path == ""
+
+# =============================================================================
+# MONITORING SETUP
+# =============================================================================
+- name: "[MONITOR] Setup basic monitoring"
+  block:
+    - name: Create monitoring script
+      copy:
+        content: |
+          #!/bin/bash
+          # Eledia Solr Monitoring - {{ customer_name }}
+          
+          LOGFILE="/var/log/eledia-solr-{{ customer_name }}.log"
+          TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+          
+          # Check container status
+          CONTAINER_STATUS=$(docker inspect --format='{{ '{{' }}.State.Status{{ '}}' }}' {{ solr_container_name }} 2>/dev/null || echo "not_found")
+          
+          # Check Solr API
+          SOLR_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8983/solr/admin/ping 2>/dev/null || echo "000")
+          
+          # Check core health
+          CORE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8983/solr/{{ solr_core_name }}/admin/ping 2>/dev/null || echo "000")
+          
+          # Log status
+          echo "[$TIMESTAMP] Container: $CONTAINER_STATUS, Solr API: $SOLR_STATUS, Core: $CORE_STATUS" >> "$LOGFILE"
+          
+          # Alert on issues (basic)
+          if [ "$CONTAINER_STATUS" != "running" ] || [ "$SOLR_STATUS" != "200" ] || [ "$CORE_STATUS" != "200" ]; then
+            echo "[$TIMESTAMP] WARNING: Solr health check failed!" >> "$LOGFILE"
+          fi
+        dest: "/opt/eledia-solr-management/{{ customer_name }}/monitor-solr.sh"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+      become: true
+
+    - name: Setup monitoring cron job
+      cron:
+        name: "Eledia Solr Monitoring - {{ customer_name }}"
+        minute: "*/5"
+        job: "/opt/eledia-solr-management/{{ customer_name }}/monitor-solr.sh"
+        user: "{{ ansible_user }}"
+      become: true
+  when: monitoring_enabled | default(false)
+
+# =============================================================================
+# INSTALLATION MARKERS AND METADATA
+# =============================================================================
+- name: "[FINALIZE] Create installation marker directory"
+  file:
+    path: "/var/lib/eledia-solr/{{ inventory_hostname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+- name: "[FINALIZE] Write installation metadata"
+  copy:
+    content: |
+      # Eledia Solr Installation Metadata
+      # Generated: {{ ansible_date_time.iso8601 }}
+      INSTALLATION_DATE="{{ ansible_date_time.iso8601 }}"
+      INSTALLATION_TIMESTAMP="{{ ansible_date_time.epoch }}"
+      ROLE_VERSION="6.0"
+      CUSTOMER_NAME="{{ customer_name }}"
+      MOODLE_DOMAIN="{{ app_domain }}"
+      SOLR_CORE="{{ solr_core_name }}"
+      SOLR_CONTAINER="{{ solr_container_name }}"
+      SOLR_VERSION="{{ solr_version | default('9.9.0') }}"
+      DATA_DIRECTORY="{{ solr_data_dir }}"
+      SSL_ENABLED="{{ ssl_enabled }}"
+      AUTH_ENABLED="{{ solr_auth_enabled | default(true) }}"
+      MONITORING_ENABLED="{{ monitoring_enabled | default(false) }}"
+      DIRECT_ACCESS="true"
+      NGINX_PROXY="false"
+      ANSIBLE_USER="{{ ansible_user }}"
+      INSTALLATION_HOST="{{ inventory_hostname }}"
+    dest: "/var/lib/eledia-solr/{{ inventory_hostname }}/installation.env"
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: "[FINALIZE] Calculate installation duration"
+  set_fact:
+    installation_duration: "{{ ansible_date_time.epoch | int - role_start_time | int }}"
+
+# =============================================================================
+# CONFIGURATION DATA OUTPUT FOR MANUAL REVIEW
+# =============================================================================
+- name: "[CONFIG] Display current additional_config_data for manual review"
+  debug:
+    msg:
+      - "================================================================"
+      - " MOODLE CONFIGURATION DATA - MANUAL REVIEW"
+      - "================================================================"
+      - ""
+      - "📋 CURRENT HOST_VARS CONTENT:"
+      - "  File: {{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+      - ""
+      - "🔍 CURRENT additional_config_data:"
+      - "  (Template display skipped to avoid recursive loops)"
+      - ""
+      - "📝 RECOMMENDED CONFIGURATION FOR MOODLE (WITH CUSTOMER CREDENTIALS):"
+      - ""
+      - "additional_config_data:"
+      - "  - \"// Eledia Solr Configuration - {{ customer_name }}\""
+      - "  - \"$CFG->forced_plugin_settings['search_solr'] = array(\""
+      - "  - \"    'server_hostname' => 'localhost',\""
+      - "  - \"    'server_port' => '{{ solr_port | default(8983) }}',\""
+      - "  - \"    'server_path' => '/solr/',\""
+      - "  - \"    'server_core' => '{{ solr_core_name }}',\""
+      - "  - \"    'server_timeout' => 30,\""
+      - "  - \"    'indexname' => '{{ solr_core_name }}',\""
+      - "  - \"    'server_username' => '{{ solr_customer_username | default(solr_auth_customer_user | default('customer')) }}',\""
+      - "  - \"    'server_password' => '{{ solr_customer_password_plain | default(solr_auth_customer_password | default('password')) }}',\""
+      - "  - \"    'ssl_cert' => '',\""
+      - "  - \"    'ssl_key' => '',\""
+      - "  - \"    'ssl_keypassword' => '',\""
+      - "  - \"    'ssl_cainfo' => '',\""
+      - "  - \"    'ssl_capath' => ''\""
+      - "  - \");\""
+      - ""
+      - "💡 TO APPLY CONFIGURATION:"
+      - "  1. Copy the recommended configuration above"
+      - "  2. Edit {{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+      - "  3. Replace/add the additional_config_data section"
+      - "  4. Run: ansible-playbook update-config-php role"
+      - ""
+      - "⚠️  IMPORTANT NOTES:"
+      - "  - This configuration will be automatically applied by Moodle integration"
+      - "  - Manual editing is only needed if automatic integration fails"
+      - "  - Always backup your host_vars file before making changes"
+      - "  - Uses CUSTOMER credentials for security (not admin)"
+      - ""
+      - "================================================================"
+
+# =============================================================================
+# APACHE SOLR PROXY CONFIGURATION (COPY/PASTE READY)
+# =============================================================================
+- name: "[APACHE] Generate Apache Solr Proxy Configuration"
+  set_fact:
+    apache_solr_config: |
+      # =============================================================================
+      # Apache Solr Proxy Configuration for {{ app_domain }}
+      # Generated: {{ ansible_date_time.iso8601 }}
+      # Customer: {{ customer_name }}
+      # =============================================================================
+      
+      # Solr Proxy Configuration - Add to your Apache VirtualHost
+      
+      <IfModule mod_rewrite.c>
+          # Enable rewrite engine
+          RewriteEngine On
+          
+          # Solr Proxy Rules
+          # Access via: https://{{ app_domain }}/__solr/
+          RewriteRule ^/__solr/(.*)$ http://127.0.0.1:{{ solr_port | default(8983) }}/solr/$1 [P,L,QSA]
+          RewriteRule ^/__solr$ http://127.0.0.1:{{ solr_port | default(8983) }}/solr/ [P,L,QSA]
+      </IfModule>
+      
+      # Alternative: Location-based configuration
+      <Location "/__solr/">
+          ProxyPass http://127.0.0.1:{{ solr_port | default(8983) }}/solr/
+          ProxyPassReverse http://127.0.0.1:{{ solr_port | default(8983) }}/solr/
+          ProxyPreserveHost On
+          
+          # Optional: Basic Authentication (remove if Solr handles auth)
+          # AuthType Basic
+          # AuthName "Solr Administration"
+          # AuthUserFile /etc/apache2/.htpasswd-solr
+          # Require valid-user
+          
+          # Optional: IP-based access restriction
+          # Require ip 127.0.0.1
+          # Require ip 192.168.1.0/24
+          
+          # Security headers
+          Header always set X-Frame-Options "SAMEORIGIN"
+          Header always set X-Content-Type-Options "nosniff"
+          Header always set X-XSS-Protection "1; mode=block"
+          
+          # Remove server information
+          Header unset Server
+      </Location>
+      
+      # Required Apache modules:
+      # a2enmod proxy
+      # a2enmod proxy_http
+      # a2enmod headers
+      # a2enmod rewrite
+      
+      # =============================================================================
+      # NGINX ALTERNATIVE CONFIGURATION
+      # =============================================================================
+      
+      # Add to your nginx server block:
+      
+      # Solr Proxy for Nginx
+      location /__solr/ {
+          proxy_pass http://127.0.0.1:{{ solr_port | default(8983) }}/solr/;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          
+          # Optional: Basic auth (remove if Solr handles auth)
+          # auth_basic "Solr Administration";
+          # auth_basic_user_file /etc/nginx/.htpasswd-solr;
+          
+          # Optional: IP restriction
+          # allow 127.0.0.1;
+          # allow 192.168.1.0/24;
+          # deny all;
+          
+          # Security headers
+          add_header X-Frame-Options "SAMEORIGIN" always;
+          add_header X-Content-Type-Options "nosniff" always;
+          add_header X-XSS-Protection "1; mode=block" always;
+      }
+      
+      # Alternative: without trailing slash redirect
+      location = /__solr {
+          return 301 /__solr/;
+      }
+      
+      # =============================================================================
+      # AUTHENTICATION INFORMATION (CURRENT SECURE PASSWORDS)
+      # =============================================================================
+      
+      # SOLR AUTHENTICATION ENABLED
+      # Admin User: {{ solr_auth_admin_user | default('admin') }}
+      # Admin Password: {{ secure_admin_password | default(solr_auth_admin_password) }}
+      # Support User: {{ solr_auth_support_user | default('support') }}
+      # Support Password: {{ solr_auth_support_password | default('N/A') }}
+      # Customer User: {{ solr_auth_customer_user | default('customer') }}
+      # Customer Password: {{ solr_auth_customer_password | default('N/A') }}
+      
+      # Access URLs:
+      # - Admin Panel: https://{{ app_domain }}/__solr/
+      # - Core Admin: https://{{ app_domain }}/__solr/#/{{ solr_core_name }}
+      # - Direct API: https://{{ app_domain }}/__solr/{{ solr_core_name }}/select?q=*:*
+      
+      # =============================================================================
+      # SECURITY RECOMMENDATIONS
+      # =============================================================================
+      
+      # 1. Enable HTTPS only
+      # 2. Use IP restrictions for admin access
+      # 3. Regular password rotation
+      # 4. Monitor access logs
+      # 5. Keep Solr version updated
+      # 6. Use firewall rules as additional protection
+
+- name: "[APACHE] Display Apache/Nginx Configuration"
+  debug:
+    msg:
+      - "================================================================"
+      - " APACHE/NGINX SOLR PROXY CONFIGURATION"
+      - "================================================================"
+      - ""
+      - "📋 COPY/PASTE READY CONFIGURATION:"
+      - ""
+      - "# ============================================================================="
+      - "# Apache Solr Proxy Configuration for {{ app_domain }}"
+      - "# Generated: {{ ansible_date_time.iso8601 }}"
+      - "# Customer: {{ customer_name }}"
+      - "# ============================================================================="
+      - ""
+      - "# Solr Proxy Configuration - Add to your Apache VirtualHost"
+      - ""
+      - "<IfModule mod_rewrite.c>"
+      - "    # Enable rewrite engine"
+      - "    RewriteEngine On"
+      - "    "
+      - "    # Solr Proxy Rules"
+      - "    # Access via: https://{{ app_domain }}/__solr/"
+      - "    RewriteRule ^/__solr/(.*)$ http://127.0.0.1:{{ solr_port | default(8983) }}/solr/$1 [P,L,QSA]"
+      - "    RewriteRule ^/__solr$ http://127.0.0.1:{{ solr_port | default(8983) }}/solr/ [P,L,QSA]"
+      - "</IfModule>"
+      - ""
+      - "# Alternative: Location-based configuration"
+      - "<Location \"/__solr/\">"
+      - "    ProxyPass http://127.0.0.1:{{ solr_port | default(8983) }}/solr/"
+      - "    ProxyPassReverse http://127.0.0.1:{{ solr_port | default(8983) }}/solr/"
+      - "    ProxyPreserveHost On"
+      - "    "
+      - "    # Optional: Basic Authentication (remove if Solr handles auth)"
+      - "    # AuthType Basic"
+      - "    # AuthName \"Solr Administration\""
+      - "    # AuthUserFile /etc/apache2/.htpasswd-solr"
+      - "    # Require valid-user"
+      - "    "
+      - "    # Optional: IP-based access restriction"
+      - "    # Require ip 127.0.0.1"
+      - "    # Require ip 192.168.1.0/24"
+      - "    "
+      - "    # Security headers"
+      - "    Header always set X-Frame-Options \"SAMEORIGIN\""
+      - "    Header always set X-Content-Type-Options \"nosniff\""
+      - "    Header always set X-XSS-Protection \"1; mode=block\""
+      - "    "
+      - "    # Remove server information"
+      - "    Header unset Server"
+      - "</Location>"
+      - ""
+      - "# Required Apache modules:"
+      - "# a2enmod proxy"
+      - "# a2enmod proxy_http"
+      - "# a2enmod headers"
+      - "# a2enmod rewrite"
+      - ""
+      - "# ============================================================================="
+      - "# NGINX ALTERNATIVE CONFIGURATION"
+      - "# ============================================================================="
+      - ""
+      - "# Add to your nginx server block:"
+      - ""
+      - "# Solr Proxy for Nginx"
+      - "location /__solr/ {"
+      - "    proxy_pass http://127.0.0.1:{{ solr_port | default(8983) }}/solr/;"
+      - "    proxy_set_header Host $host;"
+      - "    proxy_set_header X-Real-IP $remote_addr;"
+      - "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+      - "    proxy_set_header X-Forwarded-Proto $scheme;"
+      - "    "
+      - "    # Optional: Basic auth (remove if Solr handles auth)"
+      - "    # auth_basic \"Solr Administration\";"
+      - "    # auth_basic_user_file /etc/nginx/.htpasswd-solr;"
+      - "    "
+      - "    # Optional: IP restriction"
+      - "    # allow 127.0.0.1;"
+      - "    # allow 192.168.1.0/24;"
+      - "    # deny all;"
+      - "    "
+      - "    # Security headers"
+      - "    add_header X-Frame-Options \"SAMEORIGIN\" always;"
+      - "    add_header X-Content-Type-Options \"nosniff\" always;"
+      - "    add_header X-XSS-Protection \"1; mode=block\" always;"
+      - "}"
+      - ""
+      - "# Alternative: without trailing slash redirect"
+      - "location = /__solr {"
+      - "    return 301 /__solr/;"
+      - "}"
+      - ""
+      - "# ============================================================================="
+      - "# AUTHENTICATION INFORMATION (CURRENT SECURE PASSWORDS)"
+      - "# ============================================================================="
+      - ""
+      - "# SOLR AUTHENTICATION ENABLED"
+      - "# Admin User: {{ solr_auth_admin_user | default('admin') }}"
+      - "# Admin Password: {{ secure_admin_password | default(solr_auth_admin_password) }}"
+      - "# Support User: {{ solr_auth_support_user | default('support') }}"
+      - "# Support Password: {{ solr_auth_support_password | default('N/A') }}"
+      - "# Customer User: {{ solr_auth_customer_user | default('customer') }}"
+      - "# Customer Password: {{ solr_auth_customer_password | default('N/A') }}"
+      - ""
+      - "# Access URLs:"
+      - "# - Admin Panel: https://{{ app_domain }}/__solr/"
+      - "# - Core Admin: https://{{ app_domain }}/__solr/#/{{ solr_core_name }}"
+      - "# - Direct API: https://{{ app_domain }}/__solr/{{ solr_core_name }}/select?q=*:*"
+      - ""
+      - "# ============================================================================="
+      - "# SECURITY RECOMMENDATIONS"
+      - "# ============================================================================="
+      - ""
+      - "# 1. Enable HTTPS only"
+      - "# 2. Use IP restrictions for admin access"
+      - "# 3. Regular password rotation"
+      - "# 4. Monitor access logs"
+      - "# 5. Keep Solr version updated"
+      - "# 6. Use firewall rules as additional protection"
+      - ""
+      - "🔧 SETUP INSTRUCTIONS:"
+      - "  1. Copy the Apache or Nginx configuration above"
+      - "  2. Add it to your existing VirtualHost/Server block"
+      - "  3. Enable required modules (Apache: proxy, proxy_http, headers, rewrite)"
+      - "  4. Test configuration: apache2ctl configtest / nginx -t"
+      - "  5. Reload webserver: systemctl reload apache2 / nginx"
+      - ""
+      - "🌐 ACCESS AFTER SETUP:"
+      - "  Admin Panel: https://{{ app_domain }}/__solr/"
+      - "  Core Management: https://{{ app_domain }}/__solr/#/{{ solr_core_name }}"
+      - "  API Endpoint: https://{{ app_domain }}/__solr/{{ solr_core_name }}/select"
+      - ""
+
+- name: "[SECURITY] Check and regenerate weak passwords"
+  set_fact:
+    secure_admin_password: "{{ solr_auth_admin_password if (solr_auth_admin_password | length > 12 and solr_auth_admin_password not in ['changeme', 'admin', 'password', '123456', 'solr', 'SolrSecure2024!@#']) else lookup('password', '/dev/null chars=ascii_letters,digits,!@#$%^&* length=24') }}"
+    password_was_weak: "{{ true if (solr_auth_admin_password | length <= 12 or solr_auth_admin_password in ['changeme', 'admin', 'password', '123456', 'solr', 'SolrSecure2024!@#']) else false }}"
+  when: solr_auth_enabled | default(false) | bool
+
+- name: "[APACHE] Display authentication information"
+  debug:
+    msg:
+      - "🔐 AUTHENTICATION:"
+      - "  Status: ENABLED"
+      - ""
+      - "{% if password_was_weak | default(false) %}⚠️  SECURITY ALERT: Weak admin password detected and regenerated!{% endif %}"
+      - ""
+      - "👑 ADMIN ACCESS (Full System):"
+      - "  User: {{ solr_auth_admin_user | default('admin') }}"
+      - "  Password: {{ solr_admin_password_plain | default(secure_admin_password | default(solr_auth_admin_password)) }} {% if password_was_weak | default(false) %}🔄 REGENERATED{% endif %}"
+      - ""
+      - "🛠️ SUPPORT ACCESS (Limited Admin):"
+      - "  User: {{ solr_auth_support_user | default('support') }}"
+      - "  Password: {{ solr_support_password_plain | default(solr_auth_support_password | default('N/A')) }} ✅ SECURE"
+      - ""
+      - "👤 CUSTOMER ACCESS (Core-Specific):"
+      - "  User: {{ solr_auth_customer_user | default(customer_name | default('customer')) }}"
+      - "  Password: {{ solr_customer_password_plain | default(solr_auth_customer_password | default('N/A')) }} ✅ SECURE"
+      - "  Core Access: {{ solr_core_name | default('eledia_solr_' + customer_name | default('customer')) }}"
+      - ""
+      - "💡 PLAIN TEXT PASSWORDS FOR LOGIN - SAVE SECURELY!"
+  when: solr_auth_enabled | default(false) | bool
+
+- name: "[APACHE] Display no authentication info"
+  debug:
+    msg:
+      - "🔐 AUTHENTICATION:"
+      - "  Status: DISABLED (No credentials required)"
+  when: not (solr_auth_enabled | default(false) | bool)
+
+# =============================================================================
+# MULTI-TENANT ADMINISTRATOR ACCESS
+# =============================================================================
+- name: "[MULTI-TENANT] Display administrator access information"
+  debug:
+    msg:
+      - "================================================================"
+      - "🎯 MULTI-TENANT ADMINISTRATOR ACCESS"
+      - "================================================================"
+      - ""
+      - "🚀 SOLR MULTI-TENANT SERVER READY!"
+      - "  Server: {{ inventory_hostname }}"
+      - "  Port: {{ solr_docker_port | default(8983) }}"
+      - "  Binding: {{ solr_multi_tenant_bind | default('127.0.0.1') }}:{{ solr_docker_port | default(8983) }}"
+      - "  Container: {{ solr_docker_container_name | default('eledia-solr-multi-tenant') }}"
+      - ""
+      - "👑 ADMINISTRATOR LOGIN (FULL ACCESS TO ALL CORES):"
+      - "  Username: {{ solr_auth_admin_user | default('admin') }}"
+      - "  Password: {{ secure_admin_password | default(solr_auth_admin_password) }}"
+      - "  Access: ALL CORES + SYSTEM ADMINISTRATION"
+      - ""
+      - "🛠️ SUPPORT LOGIN (LIMITED ADMIN ACCESS):"
+      - "  Username: {{ solr_auth_support_user | default('support') }}"
+      - "  Password: {{ solr_auth_support_password | default('N/A') }}"
+      - "  Access: CORE MANAGEMENT + MONITORING"
+      - ""
+      - "🌐 ADMIN PANEL ACCESS:"
+      - "  Local: http://localhost:{{ solr_docker_port | default(8983) }}/solr/"
+      - "  Via Proxy: https://{{ inventory_hostname }}/__solr/"
+      - ""
+      - "🔧 CUSTOMER CORE MANAGEMENT:"
+      - "  Add Core: /tmp/scripts/create-customer.sh <domain> <moodle_version>"
+      - "  Remove Core: solr delete -c <core_name>"
+      - "  List Cores: curl -u admin:password 'http://localhost:8983/solr/admin/cores?action=STATUS'"
+      - ""
+      - "💡 CUSTOMER CORE ACCESS:"
+      - "  Each customer gets individual user account"
+      - "  Access limited to their specific core only"
+      - "  Admin has access to ALL cores"
+      - ""
+      - "⚠️  SECURITY RECOMMENDATIONS:"
+      - "  - Change admin password after first login"
+      - "  - Use Apache/Nginx proxy for HTTPS"
+      - "  - Enable IP restrictions in production"
+      - "  - Regular security updates"
+      - ""
+      - "================================================================"
+  when: 
+    - solr_is_multi_tenant | default(false) | bool
+    - solr_auth_enabled | default(false) | bool
+
+- name: "[APACHE] Display security notes"
+  debug:
+    msg:
+      - ""
+      - "⚠️  SECURITY NOTES:"
+      - "  - Configuration is NOT automatically applied"
+      - "  - Manual webserver configuration required"
+      - "  - Consider IP restrictions for production"
+      - "  - Regular security updates recommended"
+      - ""
+      - "================================================================"
+
+# =============================================================================
+# FINAL SUMMARY AND SUCCESS MESSAGE
+# =============================================================================
+- name: "[SUCCESS] Display final installation summary"
+  debug:
+    msg:
+      - "================================================================"
+      - "🚀 ELEDIA SOLR INSTALLATION COMPLETED SUCCESSFULLY!"
+      - "================================================================"
+      - ""
+      - "📊 INSTALLATION STATISTICS:"
+      - "  Version: 7.0"
+      - ""
+      - "🎯 DEPLOYMENT DETAILS:"
+      - "  Customer: {{ customer_name }}"
+      - "  Domain: {{ app_domain }}"
+      - "  Container: {{ solr_container_name }}"
+      - "  Core: {{ solr_core_name }}"
+      - "  Data Path: {{ solr_data_dir }}"
+      - "  Version: Solr {{ solr_version | default('9.9.0') }}"
+      - ""
+      - "🔗 ACCESS INFORMATION:"
+      - "  Local Admin UI: http://localhost:8983/solr/"
+      - "  Core URL: http://localhost:8983/solr/{{ solr_core_name }}/"
+      - "  API Endpoint: http://localhost:8983/solr/{{ solr_core_name }}/select"
+      - "  Health Check: http://localhost:8983/solr/admin/ping"
+      - ""
+      - "🔐 ACCESS CREDENTIALS (PLAIN TEXT - SAVE SECURELY!):"
+      - ""
+      - "👑 ADMIN (Full System Access):{% if password_was_weak | default(false) %} 🔄 PASSWORD REGENERATED{% endif %}"
+      - "  User: {{ solr_admin_username | default(solr_auth_admin_user | default('admin')) }}"
+      - "  Password: {{ solr_admin_password_plain | default(secure_admin_password | default(solr_auth_admin_password)) }}"
+      - ""
+      - "🛠️ SUPPORT (Limited Admin): ✅ SECURE"
+      - "  User: {{ solr_support_username | default(solr_auth_support_user | default('support')) }}"
+      - "  Password: {{ solr_support_password_plain | default(solr_auth_support_password | default('N/A')) }}"
+      - ""
+      - "👤 CUSTOMER ({{ customer_name | upper }}): ✅ SECURE"
+      - "  User: {{ solr_customer_username | default(solr_auth_customer_user | default(customer_name | default('customer'))) }}"
+      - "  Password: {{ solr_customer_password_plain | default(solr_auth_customer_password | default('N/A')) }}"
+      - "  Core Access: {{ solr_core_name }}"
+      - ""
+      - "📝 MOODLE CONFIGURATION:"
+      - "  Method: update-config-php role + solr_config_data"
+      - "  Variable: solr_config_data (sicher, überschreibt nicht additional_config_data)"
+      - "  Hostname: localhost"
+      - "  Port: 8983"
+      - "  Path: /solr/"
+      - "  Core: {{ solr_core_name }}"
+      - "  SSL: {{ ssl_enabled }}"
+      - "  Auth: {{ 'Enabled' if solr_auth_enabled else 'Disabled' }}"
+      - ""
+      - "🔒 NEUE SICHERHEITS-FEATURES:"
+      - "  ✅ solr_config_data: Sichere Moodle-Konfiguration ohne Überschreibung"
+      - "  ✅ Vereinheitlichte Host-Vars (ein Solr-Block)"
+      - "  ✅ Core-Testing: Moodle-ähnliche Dokumente für Funktionstests"
+      - "  ✅ Tags: --tags test --extra-vars perform_core_testing=true"
+      - ""
+      - "🧪 CORE TESTING:"
+      - "  Aktivierung: --extra-vars 'perform_core_testing=true'"
+      - "  Cleanup: --extra-vars 'cleanup_test_documents=true'"
+      - "  Test-Docs: Course, Forum, Wiki, Assignment, Resource"
+      - ""
+      - "🚀 NEXT STEPS:"
+      - "  1. Access Moodle admin panel"
+      - "  2. Enable Global Search (Site Admin → Plugins → Search)"
+      - "  3. Select 'Solr' as search engine"
+      - "  4. Verify configuration"
+      - "  5. Create initial search index"
+      - "  6. Optional: Run core tests with --tags test"
+      - ""
+
+- name: "[SUCCESS] Write completion marker"
+  copy:
+    content: "{{ ansible_date_time.iso8601 }}"
+    dest: "/var/lib/eledia-solr/{{ inventory_hostname }}/installation_completed"
+    owner: root
+    group: root
+    mode: '0644'
+  become: true

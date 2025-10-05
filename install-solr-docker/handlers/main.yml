@@ -1,0 +1,26 @@
+---
+# =============================================================================
+# HANDLERS - v3.3.1 WITH SMART BACKUP RECOVERY
+# Essential service management handlers
+# =============================================================================
+
+- name: restart docker
+  systemd:
+    name: docker
+    state: restarted
+    daemon_reload: true
+  become: true
+
+- name: reload apache2
+  systemd:
+    name: apache2
+    state: reloaded
+  become: true
+
+- name: restart apache2
+  systemd:
+    name: apache2
+    state: restarted
+  become: true
+
+# Note: Backup recovery is handled in main task flow with block/rescue

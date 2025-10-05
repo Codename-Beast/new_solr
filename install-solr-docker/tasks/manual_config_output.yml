@@ -1,0 +1,93 @@
+---
+# =============================================================================
+# MANUAL CONFIG OUTPUT FOR ADMIN COPY-PASTE
+# Version: 1.0 - Fallback when auto-patching fails
+# Maintainer: Bernd Schreistetter, Eledia GmbH
+# Description: Output ready-to-copy configuration for manual host_vars update
+# =============================================================================
+
+- name: "[MANUAL-CONFIG] Display manual configuration ready for copy-paste"
+  debug:
+    msg:
+      - "================================================================"
+      - "📋 MANUAL CONFIGURATION - READY FOR COPY-PASTE"
+      - "================================================================"
+      - "Please copy the following configuration block to your host_vars file:"
+      - "File: {{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+      - ""
+      - "# ============================================================================="
+      - "# ELEDIA SOLR CONFIGURATION - MANUAL COPY BLOCK"
+      - "# Generated: {{ ansible_date_time.iso8601 }}"
+      - "# System: {{ inventory_hostname }}"
+      - "# Mode: {{ 'Multi-Tenant' if solr_is_multi_tenant else 'Single-Tenant' }}"
+      - "# ============================================================================="
+      - ""
+      - "# Solr Core Configuration"
+      - "solr_port: {{ solr_docker_port | default('8983') }}"
+      - "solr_core_name: \"{{ solr_core_name | default('eledia_solr_' + customer_name) }}\""
+      - "solr_container_name: \"{{ solr_docker_container_name | default('eledia-solr-' + inventory_hostname) }}\""
+      - "solr_auth_enabled: {{ solr_auth_enabled | default(true) }}"
+      - ""
+      - "# Authentication Configuration"
+      - "solr_auth_admin_user: \"{{ solr_auth_admin_user | default('admin') }}\""
+      - "solr_auth_admin_password: \"{{ solr_auth_admin_password | default('CHANGE_ME') }}\""
+      - "solr_auth_support_user: \"{{ solr_auth_support_user | default('support') }}\""
+      - "solr_auth_support_password: \"{{ solr_auth_support_password | default('CHANGE_ME') }}\""
+      - ""
+      - "# Testing Configuration"
+      - "perform_core_testing: {{ perform_core_testing | default(true) }}"
+      - "cleanup_test_documents: {{ cleanup_test_documents | default(false) }}"
+      - ""
+      - "# Metadata"
+      - "solr_auth_last_updated: \"{{ ansible_date_time.iso8601 }}\""
+      - ""
+      - "================================================================"
+      - "🔧 INSTRUCTIONS:"
+      - "1. Open: {{ inventory_dir }}/host_vars/{{ inventory_hostname }}"
+      - "2. Copy the configuration block above"
+      - "3. Replace any existing Solr configuration sections"
+      - "4. Save the file"
+      - "5. Re-run the Solr installation (without manual_config_only=true)"
+      - "================================================================"
+  tags: [always, manual-config, config-output]
+
+- name: "[MANUAL-CONFIG] Save configuration to file for easy access"
+  copy:
+    content: |
+      # =============================================================================
+      # ELEDIA SOLR CONFIGURATION - MANUAL COPY BLOCK
+      # Generated: {{ ansible_date_time.iso8601 }}
+      # System: {{ inventory_hostname }}
+      # Mode: {{ 'Multi-Tenant' if solr_is_multi_tenant else 'Single-Tenant' }}
+      # =============================================================================
+      
+      # Solr Core Configuration
+      solr_port: {{ solr_docker_port | default('8983') }}
+      solr_core_name: "{{ solr_core_name | default('eledia_solr_' + customer_name) }}"
+      solr_container_name: "{{ solr_docker_container_name | default('eledia-solr-' + inventory_hostname) }}"
+      solr_auth_enabled: {{ solr_auth_enabled | default(true) }}
+      
+      # Authentication Configuration
+      solr_auth_admin_user: "{{ solr_auth_admin_user | default('admin') }}"
+      solr_auth_admin_password: "{{ solr_auth_admin_password | default('CHANGE_ME') }}"
+      solr_auth_support_user: "{{ solr_auth_support_user | default('support') }}"
+      solr_auth_support_password: "{{ solr_auth_support_password | default('CHANGE_ME') }}"
+      
+      # Testing Configuration
+      perform_core_testing: {{ perform_core_testing | default(true) }}
+      cleanup_test_documents: {{ cleanup_test_documents | default(false) }}
+      
+      # Metadata
+      solr_auth_last_updated: "{{ ansible_date_time.iso8601 }}"
+    dest: "/tmp/solr_manual_config_{{ inventory_hostname }}_{{ ansible_date_time.epoch }}.yml"
+    mode: '0644'
+  delegate_to: localhost
+  run_once: true
+
+- name: "[MANUAL-CONFIG] Display file location"
+  debug:
+    msg:
+      - "📁 Configuration also saved to file:"
+      - "/tmp/solr_manual_config_{{ inventory_hostname }}_{{ ansible_date_time.epoch }}.yml"
+      - "You can copy this file content directly to your host_vars."
+  tags: [always, manual-config, config-output]

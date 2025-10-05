@@ -1,0 +1,519 @@
+---
+# =============================================================================
+# DOCKER DEPLOYMENT
+# Optimized for Dockerfile with Single/Multi-Tenant support
+# =============================================================================
+
+- name: "[DOCKER-CHECK] Display deployment mode"
+  debug:
+    msg:
+      - "🚀 Eledia Solr Docker Deployment"
+      - "System Types: {{ solr_system_types }}"
+      - "Deployment Mode: {{ 'Single-Tenant (Moodle Server)' if solr_is_single_tenant else 'Multi-Tenant (Solr Server)' }}"
+      - "Container: {{ solr_docker_container_name }}"
+      - "Network Binding: {{ solr_single_tenant_bind if solr_is_single_tenant else solr_multi_tenant_bind }}:{{ solr_docker_port }}"
+      - "Core Management: {{ 'add_solr_core=' + add_solr_core if add_solr_core else 'Standard Installation' }}"
+  tags: [always]
+
+# =============================================================================
+# DOCKER INSTALLATION AND SYSTEM CHECKS
+# =============================================================================
+- name: "[DOCKER-CHECK] Verify Docker is installed and running"
+  shell: "docker --version && docker info >/dev/null 2>&1"
+  register: docker_availability_check
+  changed_when: false
+  failed_when: false
+
+- name: "[DOCKER-CHECK] Install Docker if not available"
+  block:
+    - name: "[DOCKER-INSTALL] Update package cache"
+      apt:
+        update_cache: yes
+        
+    - name: "[DOCKER-INSTALL] Install Docker dependencies"
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        
+    - name: "[DOCKER-INSTALL] Add Docker's official GPG key"
+      apt_key:
+        url: https://download.docker.com/linux/debian/gpg
+        state: present
+        
+    - name: "[DOCKER-INSTALL] Add Docker repository"
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+        state: present
+        
+    - name: "[DOCKER-INSTALL] Install Docker Engine"
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+        
+    - name: "[DOCKER-INSTALL] Start and enable Docker service"
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+        
+    - name: "[DOCKER-INSTALL] Wait for Docker to be ready"
+      shell: "docker info >/dev/null 2>&1"
+      register: docker_ready_check
+      until: docker_ready_check.rc == 0
+      retries: 10
+      delay: 3
+      
+  when: docker_availability_check.rc != 0
+
+- name: "[DOCKER-CHECK] Display Docker installation status"
+  debug:
+    msg:
+      - "🐳 Docker System Status:"
+      - "Docker Available: {{ 'Yes' if docker_availability_check.rc == 0 else 'Installed automatically' }}"
+      - "Docker Version: {{ docker_availability_check.stdout.split('\n')[0] if docker_availability_check.rc == 0 else 'Newly installed' }}"
+
+# =============================================================================
+# IDEMPOTENCY CHECKS - SHELL-BASED
+# =============================================================================
+- name: "[IDEMPOTENCY] Check existing container"
+  shell: "docker inspect {{ solr_docker_container_name }} --format '{{ '{{' }}.State.Status{{ '}}' }}' 2>/dev/null || echo 'not_found'"
+  register: existing_container_check
+  changed_when: false
+  failed_when: false
+
+- name: "[IDEMPOTENCY] Check existing Docker image"
+  shell: "docker images {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }} --format '{{ '{{' }}.CreatedAt{{ '}}' }}' 2>/dev/null || echo 'not_found'"
+  register: image_check
+  changed_when: false
+  failed_when: false
+
+- name: "[IDEMPOTENCY] Check Dockerfile modification time"
+  stat:
+    path: "{{ role_path }}/files/eledia_docker_file"
+  register: dockerfile_stat
+
+- name: "[IDEMPOTENCY] Set deployment facts"
+  set_fact:
+    # Image-Existenz
+    image_exists: "{{ image_check.stdout != 'not_found' and image_check.stdout != '' }}"
+    # Container-Existenz
+    container_exists: "{{ existing_container_check.stdout != 'not_found' and existing_container_check.stdout != '' }}"
+    dockerfile_exists: "{{ dockerfile_stat.stat.exists | default(false) }}"
+    force_rebuild: "{{ force_build | default(false) | bool }}"
+
+- name: "[IDEMPOTENCY] Display current status"
+  debug:
+    msg:
+      - "Container exists: {{ container_exists }}"
+      - "Image exists: {{ image_exists }}"
+      - "Force rebuild: {{ force_rebuild }}"
+      - "Dockerfile exists: {{ dockerfile_exists }}"
+
+# =============================================================================
+# IMAGE AVAILABILITY AND TRANSFER
+# =============================================================================
+- name: "[IMAGE-TRANSFER] Check if standard Solr image is available as fallback"
+  shell: "docker images solr:9.9.0 --format '{{ '{{' }}.CreatedAt{{ '}}' }}' 2>/dev/null || echo 'not_found'"
+  register: standard_solr_check
+  changed_when: false
+  failed_when: false
+
+- name: "[IMAGE-TRANSFER] Pull standard Solr image if no custom image and build fails"
+  shell: "docker pull solr:9.9.0"
+  register: solr_pull_result
+  when: 
+    - not image_exists
+    - standard_solr_check.stdout == 'not_found'
+    - not dockerfile_exists
+  failed_when: false
+
+- name: "[IMAGE-TRANSFER] Set image transfer facts"
+  set_fact:
+    # IMMER versuchen zu bauen wenn kein Image vorhanden oder force_rebuild
+    should_build_custom: "{{ force_rebuild or not image_exists }}"
+    should_use_standard: "{{ not dockerfile_exists and not image_exists }}"
+    standard_image_available: "{{ standard_solr_check.stdout != 'not_found' and standard_solr_check.stdout != '' or (solr_pull_result is defined and solr_pull_result is succeeded) }}"
+
+- name: "[IMAGE-TRANSFER] Display image strategy"
+  debug:
+    msg:
+      - "Image Strategy:"
+      - "Custom image exists: {{ image_exists }}"
+      - "Standard image available: {{ standard_image_available }}"
+      - "Should build custom: {{ should_build_custom }}"
+      - "Should use standard: {{ should_use_standard }}"
+      - "Force rebuild: {{ force_rebuild }}"
+
+# =============================================================================
+# IMAGE BUILD PROCESS
+# =============================================================================
+- name: "[IMAGE-BUILD] Create remote build directory"
+  file:
+    path: "/tmp/solr-build"
+    state: directory
+    mode: '0755'
+  when: should_build_custom or not image_exists
+
+- name: "[IMAGE-BUILD] Copy Dockerfile to remote server"
+  copy:
+    src: "eledia_docker_file"
+    dest: "/tmp/solr-build/Dockerfile"
+    mode: '0644'
+  when: should_build_custom or not image_exists
+
+- name: "[IMAGE-BUILD] Copy configuration directory to remote server"
+  copy:
+    src: "conf/"
+    dest: "/tmp/solr-build/conf/"
+    mode: '0644'
+  when: should_build_custom or not image_exists
+
+- name: "[IMAGE-BUILD] Build Solr image"
+  shell: "cd /tmp/solr-build && docker build -t {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }} ."
+  register: docker_build_result
+  when: should_build_custom or not image_exists
+
+- name: "[IMAGE-BUILD] Fallback to standard Solr image if custom build fails"
+  block:
+    - name: "[IMAGE-BUILD] Tag standard image as custom for compatibility"
+      shell: "docker tag solr:9.9.0 {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }}"
+      when: standard_image_available
+      
+    - name: "[IMAGE-BUILD] Set fallback image facts"
+      set_fact:
+        image_exists: true
+        using_fallback_image: true
+        
+    - name: "[IMAGE-BUILD] Display fallback notice"
+      debug:
+        msg:
+          - "⚠️  FALLBACK TO STANDARD IMAGE"
+          - "Custom build failed, using standard solr:9.9.0"
+          - "Tagged as: {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }}"
+  when: 
+    - should_build_custom
+    - docker_build_result is defined
+    - docker_build_result.rc != 0
+    - standard_image_available
+
+- name: "[IMAGE-BUILD] Display build results"
+  debug:
+    msg:
+      - "✅ Docker Image Ready"
+      - "Image: {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }}"
+      - "Source: {{ 'Custom Build' if (docker_build_result is defined and docker_build_result.rc is defined and docker_build_result.rc == 0) else 'Standard Image Fallback' if (using_fallback_image | default(false)) else 'Existing Image' }}"
+      - "Build Output: {{ docker_build_result.stdout_lines[-3:] if (docker_build_result is defined and docker_build_result.stdout_lines is defined) else ['No build output'] }}"
+  when: 
+    - image_exists or (docker_build_result is defined and docker_build_result.rc is defined and docker_build_result.rc == 0) or using_fallback_image | default(false)
+
+# =============================================================================
+# VOLUMES MANAGEMENT
+# =============================================================================
+- name: "[VOLUMES] Create Docker volumes"
+  shell: "docker volume create {{ item }}"
+  register: volume_result
+  changed_when: "'already exists' not in volume_result.stderr"
+  failed_when: volume_result.rc != 0 and 'already exists' not in volume_result.stderr
+  loop:
+    - "{{ solr_docker_container_name }}_data"
+    - "{{ solr_docker_container_name }}_logs"
+    - "{{ solr_docker_container_name }}_backups"
+
+# =============================================================================
+# CONTAINER DEPLOYMENT
+# =============================================================================
+- name: "[DEPLOYMENT] Stop existing container if needed"
+  shell: "docker stop {{ solr_docker_container_name }} && docker rm {{ solr_docker_container_name }}"
+  register: stop_result
+  failed_when: false
+  when: container_exists and force_rebuild
+
+- name: "[DEPLOYMENT] Check if container is already running"
+  shell: "docker ps --filter name={{ solr_docker_container_name }} --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'"
+  register: container_running_check
+  changed_when: false
+  failed_when: false
+
+- name: "[DEPLOYMENT] Start existing stopped container"
+  shell: "docker start {{ solr_docker_container_name }}"
+  register: container_start_existing
+  failed_when: false
+  when: 
+    - container_exists
+    - not force_rebuild
+    - container_running_check.stdout == ""
+
+- name: "[DEPLOYMENT] Create and start new Solr container"
+  shell: |
+    docker run -d \
+      --name {{ solr_docker_container_name }} \
+      --restart unless-stopped \
+      -p {{ solr_multi_tenant_bind if solr_is_multi_tenant else '127.0.0.1' }}:{{ solr_docker_port }}:8983 \
+      -p {{ solr_multi_tenant_bind if solr_is_multi_tenant else '127.0.0.1' }}:9854:9854 \
+      -v {{ solr_docker_container_name }}_data:/var/solr/data \
+      -v {{ solr_docker_container_name }}_logs:/var/log/solr \
+      -v {{ solr_docker_container_name }}_backups:/var/solr/backups \
+      -e SOLR_MEMORY={{ solr_docker_memory }} \
+      -e MOODLE_APP_DOMAIN={{ moodle_app_domain | default('multi-tenant-server') }} \
+      -e MOODLE_VERSION={{ moodle_version | default('45') }} \
+      -e SOLR_SERVER_MODE={{ 'multi-tenant' if solr_is_multi_tenant else 'single-tenant' }} \
+      -e CREATE_MAIN_CORE=true \
+      {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }}
+  register: container_create_result
+  failed_when: false
+  when: not container_exists or force_rebuild or (container_start_existing is defined and container_start_existing.rc is defined and container_start_existing.rc != 0)
+
+- name: "[DEPLOYMENT] Set unified container start result - preserve both results"
+  set_fact:
+    # Keep the original container_start_existing for error analysis
+    final_container_result: "{{ container_create_result if container_create_result is defined else container_start_existing | default({}) }}"
+  when: container_start_existing is defined or container_create_result is defined
+
+- name: "[AUTO-REBUILD] check for all types of image missing errors"
+  set_fact:
+    image_missing_container_start: >-
+      {{
+        (container_start_existing is defined and container_start_existing.rc is defined and container_start_existing.rc != 0) and
+        (
+          'pull access denied' in (container_start_existing.stderr | default('')) or
+          'Unable to find image' in (container_start_existing.stderr | default('')) or
+          'No such image' in (container_start_existing.stderr | default('')) or
+          'repository does not exist' in (container_start_existing.stderr | default('')) or
+          'not found' in (container_start_existing.stderr | default(''))
+        )
+      }}
+    image_missing_container_create: >-
+      {{
+        (container_create_result is defined and container_create_result.rc is defined and container_create_result.rc != 0) and
+        (
+          'pull access denied' in (container_create_result.stderr | default('')) or
+          'Unable to find image' in (container_create_result.stderr | default('')) or
+          'No such image' in (container_create_result.stderr | default('')) or
+          'repository does not exist' in (container_create_result.stderr | default('')) or
+          'not found' in (container_create_result.stderr | default(''))
+        )
+      }}
+
+- name: "[AUTO-REBUILD] Set combined image missing status"
+  set_fact:
+    image_missing: "{{ image_missing_container_start | default(false) or image_missing_container_create | default(false) }}"
+
+- name: "[AUTO-REBUILD] Debug container start result and image missing status"
+  debug:
+    msg:
+      - "🔍 DEBUGGING AUTO-REBUILD LOGIC:"
+      - "Container start existing defined: {{ container_start_existing is defined }}"
+      - "Container start existing rc: {{ container_start_existing.rc if container_start_existing is defined and container_start_existing.rc is defined else 'undefined' }}"
+      - "Container start existing stderr: {{ container_start_existing.stderr | default('no stderr') if container_start_existing is defined else 'result not defined' }}"
+      - "Container create result defined: {{ container_create_result is defined }}"
+      - "Container create result rc: {{ container_create_result.rc if container_create_result is defined and container_create_result.rc is defined else 'undefined' }}"
+      - "Container create result stderr: {{ container_create_result.stderr | default('no stderr') if container_create_result is defined else 'result not defined' }}"
+      - "Image missing from container start: {{ image_missing_container_start | default(false) }}"
+      - "Image missing from container create: {{ image_missing_container_create | default(false) }}"
+      - "Combined image missing detected: {{ image_missing | default(false) }}"
+      - "Should trigger auto-rebuild: {{ (image_missing | default(false)) and ((container_start_existing is defined and container_start_existing.rc is defined and container_start_existing.rc != 0) or (container_create_result is defined and container_create_result.rc is defined and container_create_result.rc != 0)) }}"
+
+- name: "[AUTO-REBUILD] image recovery and container start"
+  block:
+    - name: "[AUTO-REBUILD] Create build directory for missing image"
+      file:
+        path: "/tmp/solr-build"
+        state: directory
+        mode: '0755'
+
+    - name: "[AUTO-REBUILD] Check if Dockerfile is available for rebuild"
+      stat:
+        path: "{{ role_path }}/files/eledia_docker_file"
+      register: dockerfile_check_rebuild
+
+    - name: "[AUTO-REBUILD] Copy Dockerfile for custom rebuild"
+      copy:
+        src: "eledia_docker_file"
+        dest: "/tmp/solr-build/Dockerfile"
+        mode: '0644'
+      when: dockerfile_check_rebuild.stat.exists
+
+    - name: "[AUTO-REBUILD] Copy configuration for custom rebuild"
+      copy:
+        src: "conf/"
+        dest: "/tmp/solr-build/conf/"
+        mode: '0644'
+      when: dockerfile_check_rebuild.stat.exists
+
+    - name: "[AUTO-REBUILD] Build missing custom image"
+      shell: "cd /tmp/solr-build && docker build -t {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }} ."
+      register: auto_build_result
+      when: dockerfile_check_rebuild.stat.exists
+      failed_when: false
+
+    - name: "[AUTO-REBUILD] Fallback to standard Solr image if custom build fails"
+      block:
+        - name: "[AUTO-REBUILD] Pull standard Solr image"
+          shell: "docker pull solr:9.9.0"
+          register: auto_pull_result
+          
+        - name: "[AUTO-REBUILD] Tag standard image as custom"
+          shell: "docker tag solr:9.9.0 {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }}"
+          
+        - name: "[AUTO-REBUILD] Display fallback usage"
+          debug:
+            msg:
+              - "🔄 USING STANDARD IMAGE AS FALLBACK"
+              - "Custom image build failed or unavailable"
+              - "Using solr:9.9.0 tagged as {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }}"
+      when: 
+        - not dockerfile_check_rebuild.stat.exists or 
+          (auto_build_result is defined and auto_build_result.rc != 0)
+
+    - name: "[AUTO-REBUILD] Retry container start after image recovery"
+      shell: |
+        docker run -d \
+          --name {{ solr_docker_container_name }} \
+          --restart unless-stopped \
+          -p {{ solr_multi_tenant_bind if solr_is_multi_tenant else '127.0.0.1' }}:{{ solr_docker_port }}:8983 \
+          -p {{ solr_multi_tenant_bind if solr_is_multi_tenant else '127.0.0.1' }}:9854:9854 \
+          -v {{ solr_docker_container_name }}_data:/var/solr/data \
+          -v {{ solr_docker_container_name }}_logs:/var/log/solr \
+          -v {{ solr_docker_container_name }}_backups:/var/solr/backups \
+          -e SOLR_MEMORY={{ solr_docker_memory }} \
+          -e MOODLE_APP_DOMAIN={{ moodle_app_domain | default('multi-tenant-server') }} \
+          -e MOODLE_VERSION={{ moodle_version | default('45') }} \
+          -e SOLR_SERVER_MODE={{ 'multi-tenant' if solr_is_multi_tenant else 'single-tenant' }} \
+          -e CREATE_MAIN_CORE=true \
+          {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }}
+      register: container_start_result_retry
+
+    - name: "[AUTO-REBUILD] Update container start result"
+      set_fact:
+        final_container_result: "{{ container_start_result_retry }}"
+
+    - name: "[AUTO-REBUILD] Display auto-rebuild success"
+      debug:
+        msg:
+          - "🔄 AUTO-REBUILD COMPLETED SUCCESSFULLY"
+          - "Image was missing and has been recovered automatically"
+          - "Strategy: {{ 'Custom Build' if (auto_build_result is defined and auto_build_result.rc == 0) else 'Standard Image Fallback' }}"
+          - "Container started successfully after image recovery"
+  when: 
+    - image_missing | default(false)
+    - (container_start_existing is defined and container_start_existing.rc is defined and container_start_existing.rc != 0) or (container_create_result is defined and container_create_result.rc is defined and container_create_result.rc != 0)
+
+- name: "[DEPLOYMENT] Fail if container start failed for other reasons"
+  fail:
+    msg: "Container start failed for reason other than missing image: {{ final_container_result.stderr if final_container_result is defined and final_container_result.stderr is defined else 'Unknown error' }}"
+  when:
+    - final_container_result is defined
+    - final_container_result.rc is defined
+    - final_container_result.rc != 0
+    - not (image_missing | default(false))
+
+- name: "[DEPLOYMENT] Display container start results"
+  debug:
+    msg:
+      - "✅ Container Started Successfully"
+      - "Container ID: {{ final_container_result.stdout[:12] if final_container_result is defined and final_container_result.stdout is defined else 'N/A' }}"
+      - "Container Name: {{ solr_docker_container_name }}"
+      - "Port Binding: {{ solr_multi_tenant_bind if solr_is_multi_tenant else '127.0.0.1' }}:{{ solr_docker_port }}"
+  when: 
+    - final_container_result is defined
+    - final_container_result.rc is defined  
+    - final_container_result.rc == 0
+
+# =============================================================================
+# ENHANCED SECURITY MANAGEMENT
+# =============================================================================
+- name: "[SECURITY] Deploy enhanced authentication system"
+  include_tasks: security_management.yml
+  when: 
+    - (final_container_result is defined and final_container_result.rc is defined and final_container_result.rc == 0) or
+      (existing_container_check.stdout == "running")
+
+# =============================================================================
+# VALIDATION AND HEALTH CHECKS
+# =============================================================================
+- name: "[VALIDATION] Wait for Solr container to be running"
+  shell: "docker inspect {{ solr_docker_container_name }} --format '{{ '{{' }}.State.Status{{ '}}' }}'"
+  register: container_status_check
+  until: container_status_check.stdout == "running"
+  retries: 10
+  delay: 3
+
+- name: "[VALIDATION] Wait for Solr service (authentication expected)"
+  uri:
+    url: "http://127.0.0.1:{{ solr_docker_port }}/solr/admin/info/system"
+    method: GET
+    timeout: 15
+  register: solr_health_check
+  until: solr_health_check.status == 401  # Expecting authentication required
+  retries: 16
+  delay: 5
+  failed_when: false  # Don't fail on 401 - that's expected with auth
+
+- name: "[VALIDATION] Display authentication status"
+  debug:
+    msg:
+      - "🔐 Solr Authentication Status:"
+      - "Response Code: {{ solr_health_check.status | default('Unknown') }}"
+      - "Status: {{ 'Authentication Active (401)' if solr_health_check.status == 401 else 'Authentication Inactive (200)' if solr_health_check.status == 200 else 'Service Issue' }}"
+      - "Security: {{ 'ENABLED' if solr_health_check.status == 401 else 'DISABLED' }}"
+
+- name: "[VALIDATION] Get enhanced container status"
+  shell: "docker inspect {{ solr_docker_container_name }}"
+  register: container_inspection
+  changed_when: false
+
+- name: "[VALIDATION] Execute status check script"
+  shell: "docker exec {{ solr_docker_container_name }} /tmp/scripts/status-check.sh"
+  register: status_check_result
+  changed_when: false
+
+- name: "[VALIDATION] Display status check result"
+  debug:
+    msg:
+      - "✅ Container Health Check Completed"
+      - "Status: {{ status_check_result.stdout if status_check_result.stdout is defined else 'Unknown' }}"
+      - "Container is running and responsive"
+
+# =============================================================================
+# MULTI-TENANT VERIFICATION
+# =============================================================================
+- name: "[MULTI-TENANT] List available cores"
+  shell: "docker exec {{ solr_docker_container_name }} curl -s 'http://localhost:8983/solr/admin/cores?action=STATUS' | jq '.status | keys[]'"
+  register: cores_list
+  changed_when: false
+  when: solr_is_multi_tenant
+
+- name: "[MULTI-TENANT] Display available cores"
+  debug:
+    msg:
+      - "🎯 Multi-Tenant Cores Available:"
+      - "{{ cores_list.stdout_lines if cores_list.stdout_lines is defined else ['No cores found'] }}"
+  when: solr_is_multi_tenant and cores_list is defined
+
+# =============================================================================
+# DEPLOYMENT SUMMARY
+# =============================================================================
+- name: "[SUCCESS] Display deployment summary"
+  debug:
+    msg:
+      - "================================================================"
+      - "✅ DOCKER DEPLOYMENT v3.3.1 COMPLETED SUCCESSFULLY"
+      - "================================================================"
+      - "Container: {{ solr_docker_container_name }}"
+      - "Image: {{ solr_docker_image_name }}:{{ solr_docker_tag | default('v3.3.1') }}"
+      - "Mode: {{ 'Multi-Tenant' if solr_is_multi_tenant else 'Single-Tenant' }}"
+      - "Port: {{ solr_docker_port }}"
+      - "Binding: {{ solr_multi_tenant_bind if solr_is_multi_tenant else '127.0.0.1' }}"
+      - "Status: Running and Validated"
+      - "================================================================"

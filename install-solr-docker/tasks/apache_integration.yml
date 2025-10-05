@@ -1,0 +1,255 @@
+---
+# =============================================================================
+# APACHE SOLR WEB-UI INTEGRATION v3.3.1
+# Creates Apache VirtualHost for Solr Admin UI access via web
+# Maintainer: Bernd Schreistetter, Eledia GmbH
+# =============================================================================
+
+- name: "[APACHE] Check if Apache2 is installed"
+  command: which apache2
+  register: apache_check
+  failed_when: false
+  changed_when: false
+  tags: [apache, web-ui]
+
+- name: "[APACHE] Apache2 not found - Skip web integration"
+  debug:
+    msg:
+      - "⚠️ APACHE2 NOT FOUND - SKIPPING WEB INTEGRATION"
+      - "================================================================"
+      - "INFO: Apache2 is not installed on this system"
+      - "Solr is accessible via localhost:{{ solr_docker_port | default('8983') }} only"
+      - "================================================================"
+      - "To install Apache2: sudo apt-get install apache2"
+  when: apache_check.rc != 0
+  tags: [apache, web-ui]
+
+- name: "[APACHE] Generate Solr VirtualHost configuration"
+  template:
+    src: "{% if solr_use_path_based | default(false) %}apache-solr-path.conf.j2{% else %}apache-solr-vhost.conf.j2{% endif %}"
+    dest: "/tmp/solr.{{ moodle_app_domain | default(inventory_hostname) }}.conf"
+    mode: '0644'
+  when: apache_check.rc == 0
+  register: solr_vhost_config
+  tags: [apache, web-ui]
+
+- name: "[APACHE] Test Apache configuration syntax (before changes)"
+  command: apache2ctl configtest
+  register: apache_configtest_before
+  failed_when: false
+  changed_when: false
+  when: apache_check.rc == 0
+  tags: [apache, web-ui]
+
+- name: "[APACHE] Copy Solr VirtualHost to sites-available"
+  copy:
+    src: "/tmp/solr.{{ moodle_app_domain | default(inventory_hostname) }}.conf"
+    dest: "/etc/apache2/sites-available/solr.{{ moodle_app_domain | default(inventory_hostname) }}.conf"
+    remote_src: true
+    mode: '0644'
+    backup: true
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_before.rc == 0
+  become: true
+  tags: [apache, web-ui]
+
+- name: "[APACHE] Enable required Apache modules"
+  apache2_module:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - proxy
+    - proxy_http
+    - headers
+    - rewrite
+    - ssl
+  when: apache_check.rc == 0
+  become: true
+  notify: reload apache2
+  tags: [apache, web-ui]
+
+- name: "[APACHE] Test configuration with new VirtualHost"
+  command: apache2ctl configtest
+  register: apache_configtest_after
+  failed_when: false
+  changed_when: false
+  when: apache_check.rc == 0
+  become: true
+  tags: [apache, web-ui]
+
+- name: "[APACHE] Enable Solr VirtualHost site"
+  command: a2ensite "solr.{{ moodle_app_domain | default(inventory_hostname) }}.conf"
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+  become: true
+  notify: reload apache2
+  register: solr_site_enabled
+  tags: [apache, web-ui]
+
+- name: "[APACHE] Configuration test failed - Remove VirtualHost"
+  file:
+    path: "/etc/apache2/sites-available/solr.{{ moodle_app_domain | default(inventory_hostname) }}.conf"
+    state: absent
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc != 0
+  become: true
+  tags: [apache, web-ui]
+
+- name: "[SSL] Check if certbot is installed"
+  command: which certbot
+  register: certbot_check
+  failed_when: false
+  changed_when: false
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+    - solr_site_enabled is changed
+  tags: [apache, web-ui, ssl]
+
+- name: "[SSL] Extract base domain for certificate expansion"
+  set_fact:
+    base_domain: "{{ moodle_app_domain | default(inventory_hostname) }}"
+    solr_domain: "solr.{{ moodle_app_domain | default(inventory_hostname) }}"
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+    - solr_site_enabled is changed
+    - certbot_check.rc == 0
+  tags: [apache, web-ui, ssl]
+
+- name: "[SSL] Check if base domain certificate exists"
+  stat:
+    path: "/etc/letsencrypt/live/{{ base_domain }}/fullchain.pem"
+  register: base_cert_check
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+    - solr_site_enabled is changed
+    - certbot_check.rc == 0
+  tags: [apache, web-ui, ssl]
+
+- name: "[SSL] Check DNS resolution for Solr subdomain"
+  command: nslookup {{ solr_domain }}
+  register: dns_check
+  failed_when: false
+  changed_when: false
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+    - solr_site_enabled is changed
+    - certbot_check.rc == 0
+    - base_cert_check.stat.exists
+    - solr_web_ui_auto_ssl | default(true)
+  tags: [apache, web-ui, ssl]
+
+- name: "[SSL] Expand SSL certificate to include Solr subdomain"
+  command: >
+    certbot --apache 
+    -d {{ base_domain }} 
+    -d {{ solr_domain }} 
+    --expand 
+    --non-interactive 
+    --agree-tos 
+    --no-eff-email
+    {% if solr_web_ui_ssl_email is defined and solr_web_ui_ssl_email | length > 0 %}--email {{ solr_web_ui_ssl_email }}{% endif %}
+  register: certbot_expand
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+    - solr_site_enabled is changed
+    - certbot_check.rc == 0
+    - base_cert_check.stat.exists
+    - solr_web_ui_auto_ssl | default(true)
+    - dns_check.rc == 0  # Only if DNS resolves
+  become: true
+  ignore_errors: true
+  tags: [apache, web-ui, ssl]
+
+- name: "[SSL] Certificate expansion successful"
+  debug:
+    msg:
+      - "🔐 SSL CERTIFICATE EXPANDED SUCCESSFULLY"
+      - "================================================================"
+      - "Base domain: {{ base_domain }}"
+      - "Solr domain: {{ solr_domain }}"
+      - "Certificate updated for both domains"
+      - "================================================================"
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+    - solr_site_enabled is changed
+    - certbot_check is defined and certbot_check.rc == 0
+    - base_cert_check is defined and base_cert_check.stat.exists
+    - solr_web_ui_auto_ssl | default(true)
+    - dns_check is defined and dns_check.rc == 0
+    - certbot_expand is defined
+    - certbot_expand.rc == 0
+  tags: [apache, web-ui, ssl]
+
+- name: "[SSL] Certificate expansion info (DNS resolution failed)"
+  debug:
+    msg:
+      - "⚠️ DNS RESOLUTION FAILED"
+      - "================================================================"
+      - "Domain {{ solr_domain }} does not resolve to an IP address"
+      - ""
+      - "SOLUTIONS:"
+      - "1. Create DNS A-Record: {{ solr_domain }} -> [Server-IP]"
+      - "2. Use path-based access: https://{{ base_domain }}/solr-admin/"
+      - "3. Manual SSL: sudo certbot --apache -d {{ base_domain }} -d {{ solr_domain }} --expand"
+      - "================================================================"
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+    - solr_site_enabled is changed
+    - dns_check is defined
+    - dns_check.rc != 0
+  tags: [apache, web-ui, ssl]
+
+- name: "[SUCCESS] Solr Web-UI Integration completed"
+  debug:
+    msg:
+      - "🌐 SOLR WEB-UI INTEGRATION COMPLETED"
+      - "================================================================"
+      - "Solr Admin UI accessible at:"
+      - "{% if solr_use_path_based | default(false) %}https://{{ moodle_app_domain | default(inventory_hostname) }}/solr-admin/{% else %}https://{{ solr_domain | default('solr.' + (moodle_app_domain | default(inventory_hostname))) }}/{% endif %}"
+      - ""
+      - "🔐 Authentication required:"
+      - "Username: {{ solr_admin_user | default('admin') }}"
+      - "Password: {{ solr_admin_password | default('[Generated in host_vars]') }}"
+      - ""
+      - "📁 Configuration file:"
+      - "{% if solr_use_path_based | default(false) %}/tmp/solr.{{ moodle_app_domain | default(inventory_hostname) }}.conf (path-based config){% else %}/etc/apache2/sites-available/solr.{{ moodle_app_domain | default(inventory_hostname) }}.conf{% endif %}"
+      - ""
+      - "🔐 SSL Status:"
+      - "{% if certbot_expand is defined and certbot_expand.get('rc', 1) == 0 %}✅ SSL certificate automatically configured{% else %}⚠️ Manual SSL configuration required{% endif %}"
+      - "================================================================"
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc == 0
+    - solr_site_enabled is changed
+  tags: [apache, web-ui]
+
+- name: "[ERROR] Apache configuration failed"
+  debug:
+    msg:
+      - "❌ APACHE CONFIGURATION FAILED"
+      - "================================================================"
+      - "ConfigTest Result: {{ apache_configtest_after.stderr | default('Unknown error') }}"
+      - "Action: VirtualHost file removed for safety"
+      - "Check Apache logs: /var/log/apache2/error.log"
+      - "================================================================"
+  when: 
+    - apache_check.rc == 0
+    - apache_configtest_after.rc != 0
+  tags: [apache, web-ui]
+
+- name: "[CLEANUP] Remove temporary configuration file"
+  file:
+    path: "/tmp/solr.{{ moodle_app_domain | default(inventory_hostname) }}.conf"
+    state: absent
+  when: apache_check.rc == 0
+  tags: [apache, web-ui]

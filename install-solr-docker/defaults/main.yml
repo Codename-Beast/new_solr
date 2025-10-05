@@ -1,0 +1,182 @@
+---
+# =============================================================================
+# ELEDIA SOLR ROLE DEFAULT VARIABLES - VERSION 8.0
+# Dockerfile v3.3.1 - Docker-first approach
+# =============================================================================
+
+# =============================================================================
+# SYSTEM TYPE DETECTION AND DEPLOYMENT MODE
+# =============================================================================
+# Determine deployment mode based on system_type hostvars
+# Single-Tenant: system_type contains 'moodle'/'Moodle' -> Solr on Moodle server
+# Multi-Tenant: system_type contains 'solr'/'Solr' (without moodle) -> Standalone Solr server
+solr_system_types: "{{ hostvars[inventory_hostname].system_type | default([]) }}"
+solr_system_types_lower: "{{ solr_system_types | map('lower') | list }}"
+solr_is_single_tenant: "{{ 'moodle' in solr_system_types_lower }}"
+solr_is_multi_tenant: "{{ 'solr' in solr_system_types_lower and 'moodle' not in solr_system_types_lower }}"
+
+# Force rebuild parameters (can be overridden via -e)
+# force_build: true  # Use -e force_build=true to force rebuild
+
+# =============================================================================
+# DOCKER CONFIGURATION (ALWAYS ENABLED - v3.3.1)
+# =============================================================================
+solr_use_docker: true
+solr_docker_image_name: "eledia-solr"
+solr_docker_tag: "v3.3.1"
+solr_docker_port: 8983
+solr_docker_data_volume: "eledia-solr-data"
+solr_docker_memory: "2g"  # Production-ready default
+
+# Dynamic container naming based on mode
+solr_docker_container_name: "{{ 'eledia-solr-' + (moodle_app_domain | regex_replace('[^a-zA-Z0-9]', '') if solr_is_single_tenant else 'multi-tenant') }}"
+
+# =============================================================================
+# CORE SOLR CONFIGURATION (v3.3.1 optimized)
+# =============================================================================
+solr_version: "9.9.0"
+solr_port: "{{ solr_docker_port }}"
+solr_heap_size: "{{ solr_docker_memory }}"  # Aligned with Docker memory
+solr_java_mem: "-Xms{{ solr_docker_memory }} -Xmx{{ solr_docker_memory }}"
+solr_opts: "-Dsolr.log.level=INFO -Duser.timezone=UTC"
+
+# =============================================================================
+# SINGLE-TENANT CONFIGURATION (system_type: moodle)
+# =============================================================================
+solr_single_tenant_core_name: "{{ 'eledia_solr_' + (moodle_app_domain | regex_replace('[^a-zA-Z0-9]', '')) if solr_is_single_tenant else '' }}"
+solr_single_tenant_bind: "127.0.0.1"  # Localhost only
+
+# =============================================================================
+# MULTI-TENANT CORE MANAGEMENT
+# =============================================================================
+# Add new customer core to Multi-Tenant Solr server
+add_solr_core: ""
+
+# Remove customer core from Multi-Tenant Solr server
+remove_solr_core: ""
+
+# Reload existing core (configuration changes)
+reload_solr_core: ""
+
+# Force core removal without confirmation pause (use with caution!)
+force_core_removal: false
+
+# Multi-Tenant customer and server hostvars for core addition
+kunden_moodle_hostvars: ""  # e.g., "moodle.customer.com"
+solr_server_hostvars: ""    # e.g., "solr.company.com"
+
+# =============================================================================
+# AUTHENTICATION & SECURITY
+# =============================================================================
+solr_auth_enabled: true  # Always enabled
+
+# Define weak/insecure passwords that should be replaced
+solr_weak_passwords:
+  - "changeme"
+  - "admin"
+  - "password"
+  - "123456"
+  - "solr"
+  - "SolrSecure2024!@#"  # Old default
+
+# Admin User (Full Access) - Auto-generate secure password if weak/missing
+solr_admin_username: "admin"
+solr_admin_password_raw: "{{ vault_solr_admin_password | default('') }}"
+solr_admin_password: "{{ solr_admin_password_raw if (solr_admin_password_raw | length > 0 and solr_admin_password_raw not in solr_weak_passwords) else lookup('password', '/dev/null chars=ascii_letters,digits,!@#$%^&* length=24') }}"
+solr_auth_admin_user: "{{ solr_admin_username }}"
+solr_auth_admin_password: "{{ solr_admin_password }}"
+
+# Support User (Limited Access) - Always generate secure password
+solr_auth_support_user: "support"
+solr_auth_support_password: "{{ vault_solr_support_password | default(lookup('password', '/dev/null chars=ascii_letters,digits length=16')) }}"
+
+# Customer User (Core-Specific Access) - Always generate secure password  
+solr_customer_username: "{{ customer_name | default(moodle_app_domain.split('.')[0] if moodle_app_domain is defined else 'customer') }}"
+solr_customer_password: "{{ vault_solr_customer_password | default(lookup('password', '/dev/null chars=ascii_letters,digits length=16')) }}"
+solr_auth_customer_user: "{{ solr_customer_username }}"
+solr_auth_customer_password: "{{ solr_customer_password }}"
+
+# Docker Environment Variables  
+solr_docker_env_vars:
+  SOLR_PASSWORD: "{{ solr_auth_admin_password }}"
+  SOLR_USERNAME: "{{ solr_auth_admin_user }}"
+  SOLR_SUPPORT_USER: "{{ solr_auth_support_user }}"
+  SOLR_SUPPORT_PASSWORD: "{{ solr_auth_support_password }}"
+  SOLR_CUSTOMER_USER: "{{ solr_auth_customer_user }}"
+  SOLR_CUSTOMER_PASSWORD: "{{ solr_auth_customer_password }}"
+  MOODLE_APP_DOMAIN: "{{ moodle_app_domain | default('') if solr_is_single_tenant else '' }}"
+  MOODLE_VERSION: "{{ moodle_version | default('45') }}"
+  CREATE_MAIN_CORE: "true"  # Always create default core for both modes
+  SOLR_SERVER_MODE: "{{ 'single-tenant' if solr_is_single_tenant else 'multi-tenant' }}"
+  SOLR_EXTERNAL_ACCESS: "{{ 'false' if solr_is_single_tenant else 'true' }}"
+  SOLR_MEMORY: "{{ solr_docker_memory }}"
+  SOLR_LOG_LEVEL: "INFO"
+  ENABLE_METRICS: "true"
+  METRICS_PORT: "9854"
+  SOLR_TIMEZONE: "UTC"
+
+# =============================================================================
+# INSTALLATION BEHAVIOR (v3.3.1)
+# =============================================================================
+# Installation control with enhanced idempotency
+skip_solr_installation: false  # Auto-detected based on existing installation
+install_solr_version: "8.0"
+force_recreate_container: false  # Force container recreation
+force_rebuild_image: false  # Force image rebuild
+
+# Deployment validation
+solr_validate_deployment: true
+solr_health_check_timeout: 30
+solr_startup_wait_time: 60
+# =============================================================================
+# SECURITY AND AUTHENTICATION
+# =============================================================================
+# Solr Authentication (BasicAuth Plugin)
+solr_admin_user: ""                      # Admin username (defaults to customer_admin)
+solr_admin_password_hash: "YkMQhAJ0x4uPROoGKzrQr5QF9jKwb6LBIh3Cz84g5T8= aJJkCkdBB5Gl9jPsG6Xyk8FjfC4zA7yUE7nLl"  # Password: admin123
+solr_moodle_user: ""                     # Moodle username (defaults to customer_moodle)
+solr_moodle_password_hash: "YkMQhAJ0x4uPROoGKzrQr5QF9jKwb6LBIh3Cz84g5T8= aJJkCkdBB5Gl9jPsG6Xyk8FjfC4zA7yUE7nLl"  # Password: admin123
+
+# =============================================================================
+# APACHE WEB-UI INTEGRATION
+# =============================================================================
+enable_solr_web_ui: false               # Enable Apache Web-UI integration
+solr_web_ui_auto_ssl: true              # Automatic SSL certificate expansion
+solr_web_ui_ssl_email: ""               # Email for Let's Encrypt registration
+solr_web_ui_force_ssl: true             # Force HTTPS redirection
+solr_use_path_based: false              # Use path-based access (/solr-admin) instead of subdomain
+
+# =============================================================================
+# APACHE REVERSE PROXY CONFIGURATION
+# =============================================================================
+solr_enable_apache_proxy: false          # Set to true to enable Apache proxy
+solr_admin_path: "__solr"                # URL path for Solr admin UI (e.g. __solr or solr)
+solr_enable_api_proxy: false             # Enable separate API proxy for Moodle
+solr_api_path: "__solr_api"              # URL path for API access
+solr_allowed_ips: []                     # Additional IPs for Solr admin access
+                                         # Example: ['192.168.1.0/24', '10.0.0.50']
+# =============================================================================
+# MOODLE INTEGRATION
+# =============================================================================
+# Moodle integration (optional)
+# moodle_app_domain: ""  # Required for customer name extraction
+# moodle_path: ""        # Optional for config.php updates
+
+# =============================================================================
+# ADVANCED SETTINGS (v3.3.1)
+# =============================================================================
+# Advanced Docker settings
+solr_data_dir: "/opt/eledia-solr-data/{{ customer_name | default('default') }}"
+solr_backup_dir: "/var/solr/backups"
+solr_metrics_enabled: true
+solr_prometheus_port: 9854
+
+# Advanced Solr settings
+solr_dry_run_mode: false
+solr_circuit_breaker_enabled: true
+solr_circuit_breaker_threshold: 3
+
+# Testing and validation
+solr_test_cores: true
+solr_test_endpoints: true
+perform_core_testing: false  # Default disabled for production
